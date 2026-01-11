@@ -344,6 +344,23 @@ Se vedlagt PDF for detaljer og bilder.
 Automatisk generert av Pipeline V0
 """
             
+            # Prepare attachments
+            attachments = [(pdf_filename, pdf_bytes)]
+            
+            # Add audio if present
+            audio_data = data.get('audio')
+            if audio_data:
+                try:
+                    # Extract base64 audio
+                    if ',' in audio_data:
+                        audio_data = audio_data.split(',')[1]
+                    audio_bytes = base64.b64decode(audio_data)
+                    audio_filename = f"lydopptak_{timestamp}.webm"
+                    attachments.append((audio_filename, audio_bytes))
+                    print(f"[JOB] Audio attached: {audio_filename}")
+                except Exception as e:
+                    print(f"[JOB] Audio error: {e}")
+            
             # Send email
             email_sent = False
             if office_email:
@@ -352,7 +369,7 @@ Automatisk generert av Pipeline V0
                     to_email=office_email,
                     subject=subject,
                     body=body,
-                    attachments=[(pdf_filename, pdf_bytes)]
+                    attachments=attachments
                 )
             
             self._json({
