@@ -104,21 +104,23 @@ class PDFGenerator:
         story.append(Spacer(1, 4*mm))
         
         # Info section
-        address = f"GPS: {location.get('lat', 0):.5f}, {location.get('lng', 0):.5f}" if location else 'Ikke tilgjengelig'
+        customer = job_data.get('customer', '')
+        job_desc = job_data.get('jobDescription', '')
+        address = customer if customer else (f"GPS: {location.get('lat', 0):.5f}, {location.get('lng', 0):.5f}" if location else 'Ikke tilgjengelig')
         
         info_left = [
-            [Paragraph("<font size=8 color='#666666'>RAPPORTNUMMER</font>", self.styles['Normal'])],
-            [Paragraph(f"<b>{job_data.get('id', 'N/A')[:16]}</b>", self.styles['Normal'])],
+            [Paragraph("<font size=8 color='#666666'>KUNDE / ADRESSE</font>", self.styles['Normal'])],
+            [Paragraph(f"<b>{address}</b>", self.styles['Normal'])],
             [Spacer(1, 2*mm)],
             [Paragraph("<font size=8 color='#666666'>DATO / TID</font>", self.styles['Normal'])],
             [Paragraph(f"<b>{date_str} kl. {time_str}</b>", self.styles['Normal'])],
         ]
         info_right = [
-            [Paragraph("<font size=8 color='#666666'>ARBEIDSSTED</font>", self.styles['Normal'])],
-            [Paragraph(f"<b>{address}</b>", self.styles['Normal'])],
-            [Spacer(1, 2*mm)],
             [Paragraph("<font size=8 color='#666666'>UTFØRT AV</font>", self.styles['Normal'])],
             [Paragraph(f"<b>{plumber.get('name', 'N/A')}</b>", self.styles['Normal'])],
+            [Spacer(1, 2*mm)],
+            [Paragraph("<font size=8 color='#666666'>RAPPORTNUMMER</font>", self.styles['Normal'])],
+            [Paragraph(f"<b>{job_data.get('id', 'N/A')[:16]}</b>", self.styles['Normal'])],
         ]
         
         info_table = Table([
@@ -131,6 +133,12 @@ class PDFGenerator:
         ]))
         story.append(info_table)
         story.append(Spacer(1, 4*mm))
+        
+        # Job description if provided
+        if job_desc:
+            story.append(Paragraph("<font color='#2C5282'><b>ARBEID UTFØRT</b></font>", self.styles['Heading4']))
+            story.append(Paragraph(job_desc, self.styles['Normal']))
+            story.append(Spacer(1, 4*mm))
         
         # Status
         story.append(Paragraph("<font color='#2C5282'><b>STATUS</b></font>", self.styles['Heading4']))
@@ -323,25 +331,31 @@ class PipelineHandler(BaseHTTPRequestHandler):
             company = data.get('company', {})
             plumber = data.get('plumber', {})
             answers = data.get('answers', {})
+            customer = data.get('customer', 'Ikke oppgitt')
+            job_desc = data.get('jobDescription', '')
+            notes = data.get('notes', '')
             
             office_email = company.get('office_email') or CONFIG['default_office_email']
             
-            subject = f"Jobbrapport - {plumber.get('name', 'Ukjent')} - {timestamp[:8]}"
+            subject = f"Jobbrapport - {customer or plumber.get('name', 'Ukjent')} - {timestamp[:8]}"
             body = f"""Ny jobbrapport mottatt.
 
+Kunde/Adresse: {customer or 'Ikke oppgitt'}
 Rørlegger: {plumber.get('name', 'N/A')}
 Tidspunkt: {data.get('timestamp', 'N/A')[:19].replace('T', ' ')}
-Firma: {company.get('name', 'N/A')}
+{f'Arbeid: {job_desc}' if job_desc else ''}
 
 Status:
 - Fullført: {'Ja' if answers.get('completed') else 'Nei'}
 - Materialer byttet: {'Ja' if answers.get('materials') else 'Nei'}
-- Oppfølging: {'Ja' if answers.get('followup') else 'Nei'}
+- Oppfølging nødvendig: {'Ja' if answers.get('followup') else 'Nei'}
+{f'Notater: {notes}' if notes else ''}
 
 Se vedlagt PDF for detaljer og bilder.
+{' Lydopptak vedlagt.' if data.get('audio') else ''}
 
 ---
-Automatisk generert av Pipeline V0
+Automatisk generert av VVS Dokumentasjon
 """
             
             # Prepare attachments
