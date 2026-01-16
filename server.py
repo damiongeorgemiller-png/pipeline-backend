@@ -361,6 +361,23 @@ Automatisk generert av VVS Dokumentasjon
             # Prepare attachments
             attachments = [(pdf_filename, pdf_bytes)]
             
+            # Add photos as separate attachments
+            photos = data.get('photos', {})
+            photo_labels = {'before': 'for', 'during': 'under', 'detail': 'detalj', 'after': 'etter'}
+            for key, photo_data in photos.items():
+                if photo_data and photo_data.get('data'):
+                    try:
+                        img_data = photo_data['data']
+                        if ',' in img_data:
+                            img_data = img_data.split(',')[1]
+                        img_bytes = base64.b64decode(img_data)
+                        label = photo_labels.get(key, key)
+                        photo_filename = f"bilde_{label}_{timestamp}.jpg"
+                        attachments.append((photo_filename, img_bytes))
+                        print(f"[JOB] Photo attached: {photo_filename}")
+                    except Exception as e:
+                        print(f"[JOB] Photo attach error {key}: {e}")
+            
             # Add audio if present
             audio_data = data.get('audio')
             if audio_data:
