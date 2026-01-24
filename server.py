@@ -109,7 +109,7 @@ class PDFGenerator:
         # Blue header bar
         header_table = Table([['']], colWidths=[170*mm], rowHeights=[10*mm])
         header_table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,-1), HexColor('#1a3a42'))
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#0d1f26'))
         ]))
         story.append(header_table)
         story.append(Spacer(1, 5*mm))
@@ -144,7 +144,7 @@ class PDFGenerator:
         # Work description
         job_desc = job_data.get('jobDescription', '')
         if job_desc:
-            story.append(Paragraph("<i>ARBEID UTFØRT</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
+            story.append(Paragraph("<i>ARBEID UTFØRT</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#0d1f26'), fontName='Helvetica-Oblique')))
             story.append(Paragraph(job_desc, self.styles['Normal']))
             story.append(Spacer(1, 5*mm))
         
@@ -172,17 +172,17 @@ class PDFGenerator:
         # Materials
         materials = job_data.get('materials', [])
         if materials:
-            story.append(Paragraph("<i>MATERIALER BRUKT</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
+            story.append(Paragraph("<i>MATERIALER BRUKT</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#0d1f26'), fontName='Helvetica-Oblique')))
             materials_text = ", ".join(materials)
             story.append(Paragraph(materials_text, self.styles['Normal']))
             story.append(Spacer(1, 5*mm))
         
         # Status section with blue header
-        story.append(Paragraph("<i>STATUS</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
+        story.append(Paragraph("<i>STATUS</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#0d1f26'), fontName='Helvetica-Oblique')))
         
         status_header = Table([['KONTROLLPUNKT']], colWidths=[170*mm])
         status_header.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,-1), HexColor('#1a3a42')),
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#0d1f26')),
             ('TEXTCOLOR', (0,0), (-1,-1), HexColor('#FFFFFF')),
             ('FONT', (0,0), (-1,-1), 'Helvetica-Bold', 10),
             ('LEFTPADDING', (0,0), (-1,-1), 10),
@@ -214,7 +214,7 @@ class PDFGenerator:
         # Photos section
         photos_obj = job_data.get('photos', {})
         if photos_obj:
-            story.append(Paragraph("<i>FOTODOKUMENTASJON</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
+            story.append(Paragraph("<i>FOTODOKUMENTASJON</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#0d1f26'), fontName='Helvetica-Oblique')))
             
             photo_keys = ['before', 'during', 'detail', 'after']
             photo_labels = ['FØR — Utgangspunkt', 'ÅPENT — Under arbeid', 'DETALJ — Viktig info', 'ETTER — Ferdig resultat']
