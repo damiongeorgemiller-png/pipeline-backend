@@ -97,19 +97,27 @@ class PDFGenerator:
     
     def generate(self, job_data):
         buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=20*mm, rightMargin=20*mm, topMargin=20*mm, bottomMargin=20*mm)
+        doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=20*mm, rightMargin=20*mm, topMargin=15*mm, bottomMargin=20*mm)
         story = []
+        
+        # Blue header bar
+        header_table = Table([['']], colWidths=[170*mm], rowHeights=[8*mm])
+        header_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#235774')),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE')
+        ]))
+        story.append(header_table)
+        story.append(Spacer(1, 3*mm))
         
         # Company header
         company = job_data.get('company', {})
         story.append(Paragraph(company.get('name', 'VVS Bedrift'), self.styles['CompanyName']))
-        story.append(Paragraph(f"Org.nr: {company.get('orgNr', 'N/A')}", self.styles['CompanyInfo']))
-        story.append(Paragraph(f"Tlf: {company.get('phone', 'N/A')}", self.styles['CompanyInfo']))
-        story.append(Spacer(1, 8*mm))
+        story.append(Paragraph(f"Org.nr: {company.get('orgNr', 'N/A')} | Tlf: {company.get('phone', 'N/A')}", self.styles['CompanyInfo']))
+        story.append(Spacer(1, 6*mm))
         
         # Title
         story.append(Paragraph("JOBBRAPPORT", self.styles['Heading1']))
-        story.append(Spacer(1, 6*mm))
+        story.append(Spacer(1, 5*mm))
         
         # Job info
         timestamp = job_data.get('timestamp', '')
@@ -128,7 +136,6 @@ class PDFGenerator:
             ['Tid:', time_str],
             ['Montør:', plumber.get('name', 'N/A')],
             ['Kunde:', job_data.get('customer', 'N/A')],
-            ['Adresse:', job_data.get('location', {}).get('address', 'N/A') if isinstance(job_data.get('location'), dict) else 'N/A']
         ]
         
         # Add start/end time if present
@@ -136,6 +143,8 @@ class PDFGenerator:
             info_data.append(['Starttid:', job_data.get('startTime')])
         if job_data.get('endTime'):
             info_data.append(['Sluttid:', job_data.get('endTime')])
+        if job_data.get('kilometers'):
+            info_data.append(['Kjørt distanse:', f"{job_data.get('kilometers')} km"])
         
         info_table = Table(info_data, colWidths=[40*mm, 130*mm])
         info_table.setStyle(TableStyle([
@@ -146,7 +155,7 @@ class PDFGenerator:
             ('BOTTOMPADDING', (0, 0), (-1, -1), 3*mm)
         ]))
         story.append(info_table)
-        story.append(Spacer(1, 6*mm))
+        story.append(Spacer(1, 5*mm))
         
         # Job description
         job_desc = job_data.get('jobDescription', '')
@@ -182,14 +191,13 @@ class PDFGenerator:
             ('BOTTOMPADDING', (0, 0), (-1, -1), 2*mm)
         ]))
         story.append(status_table)
-        story.append(Spacer(1, 6*mm))
+        story.append(Spacer(1, 5*mm))
         
-        # Photos
+        # Photos - smaller in PDF
         photos_obj = job_data.get('photos', {})
         if photos_obj:
             story.append(Paragraph("Fotodokumentasjon", self.styles['SectionHeader']))
             
-            # Get up to 4 photos
             photo_keys = ['before', 'during', 'detail', 'after']
             photos = []
             
@@ -201,7 +209,6 @@ class PDFGenerator:
                     elif isinstance(photo_data, str):
                         photos.append(photo_data)
             
-            # Add extra photos if any
             for key, value in photos_obj.items():
                 if key.startswith('extra_') and value:
                     if isinstance(value, dict) and 'data' in value:
@@ -222,8 +229,6 @@ class PDFGenerator:
                                 
                                 img_bytes = base64.b64decode(img_data)
                                 img = Image.open(BytesIO(img_bytes))
-                                
-                                # Resize
                                 img.thumbnail((800, 600), Image.Resampling.LANCZOS)
                                 
                                 img_buffer = BytesIO()
@@ -255,11 +260,16 @@ class PDFGenerator:
         # Notes
         notes = job_data.get('notes', '')
         if notes:
-            story.append(Spacer(1, 6*mm))
+            story.append(Spacer(1, 5*mm))
             story.append(Paragraph("Merknader", self.styles['SectionHeader']))
             story.append(Paragraph(notes, self.styles['Normal']))
         
-        # Build PDF
+        # Blue footer bar
+        story.append(Spacer(1, 5*mm))
+        footer_bar = Table([['']], colWidths=[170*mm], rowHeights=[3*mm])
+        footer_bar.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), HexColor('#235774'))]))
+        story.append(footer_bar)
+        
         doc.build(story)
         buffer.seek(0)
         return buffer.getvalue()
@@ -367,17 +377,62 @@ class PipelineHandler(BaseHTTPRequestHandler):
 Kunde: {customer}
 Jobb ID: {job_id}
 
-Se vedlagt PDF for detaljer.
+Se vedlagt PDF for detaljer og separate bilder.
 
 ---
 Automatisk generert av VVS Pipeline
 """
                 
+                # Prepare attachments: PDF + separate photos
+                attachments = [(pdf_filename, pdf_bytes)]
+                
+                # Add photos as separate attachments
+                photos_obj = data.get('photos', {})
+                if photos_obj:
+                    photo_keys = ['before', 'during', 'detail', 'after']
+                    photo_count = 1
+                    
+                    for key in photo_keys:
+                        if key in photos_obj and photos_obj[key]:
+                            photo_data = photos_obj[key]
+                            if isinstance(photo_data, dict) and 'data' in photo_data:
+                                photo_data = photo_data['data']
+                            
+                            try:
+                                if photo_data.startswith('data:image'):
+                                    photo_data = photo_data.split(',')[1]
+                                
+                                photo_bytes = base64.b64decode(photo_data)
+                                photo_filename = f"bilde_{photo_count}_{key}.jpg"
+                                attachments.append((photo_filename, photo_bytes))
+                                photo_count += 1
+                            except Exception as e:
+                                print(f"[ERROR] Photo attachment: {e}")
+                    
+                    # Add extra photos
+                    for key, value in photos_obj.items():
+                        if key.startswith('extra_') and value:
+                            if isinstance(value, dict) and 'data' in value:
+                                photo_data = value['data']
+                            else:
+                                photo_data = value
+                            
+                            try:
+                                if photo_data.startswith('data:image'):
+                                    photo_data = photo_data.split(',')[1]
+                                
+                                photo_bytes = base64.b64decode(photo_data)
+                                photo_filename = f"bilde_{photo_count}_{key}.jpg"
+                                attachments.append((photo_filename, photo_bytes))
+                                photo_count += 1
+                            except Exception as e:
+                                print(f"[ERROR] Extra photo attachment: {e}")
+                
                 self.email_sender.send(
                     to_email=CONFIG['office_email'],
                     subject=email_subject,
                     body=email_body,
-                    attachments=[(pdf_filename, pdf_bytes)]
+                    attachments=attachments
                 )
             
             self._json({
