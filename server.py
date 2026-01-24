@@ -100,126 +100,143 @@ class PDFGenerator:
         doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=20*mm, rightMargin=20*mm, topMargin=15*mm, bottomMargin=20*mm)
         story = []
         
-        # Blue header bar
-        header_table = Table([['']], colWidths=[170*mm], rowHeights=[8*mm])
-        header_table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,-1), HexColor('#235774')),
-            ('VALIGN', (0,0), (-1,-1), 'MIDDLE')
-        ]))
-        story.append(header_table)
-        story.append(Spacer(1, 3*mm))
-        
         # Company header
         company = job_data.get('company', {})
         story.append(Paragraph(company.get('name', 'VVS Bedrift'), self.styles['CompanyName']))
-        story.append(Paragraph(f"Org.nr: {company.get('orgNr', 'N/A')} | Tlf: {company.get('phone', 'N/A')}", self.styles['CompanyInfo']))
-        story.append(Spacer(1, 6*mm))
+        story.append(Paragraph(f"Org.nr: {company.get('orgNr', 'N/A')}", self.styles['CompanyInfo']))
+        story.append(Spacer(1, 3*mm))
         
-        # Title
-        story.append(Paragraph("JOBBRAPPORT", self.styles['Heading1']))
+        # Blue header bar
+        header_table = Table([['']], colWidths=[170*mm], rowHeights=[10*mm])
+        header_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#1a3a42'))
+        ]))
+        story.append(header_table)
         story.append(Spacer(1, 5*mm))
         
-        # Job info
+        # Customer section with light background
+        story.append(Paragraph("KUNDE / ADRESSE", self.styles['FieldLabel']))
+        customer_table = Table([[job_data.get('customer', 'N/A')]], colWidths=[170*mm])
+        customer_table.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#F5F5F5')),
+            ('BOX', (0,0), (-1,-1), 1, HexColor('#E0E0E0')),
+            ('LEFTPADDING', (0,0), (-1,-1), 10),
+            ('RIGHTPADDING', (0,0), (-1,-1), 10),
+            ('TOPPADDING', (0,0), (-1,-1), 8),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ('FONT', (0,0), (-1,-1), 'Helvetica-Bold', 11)
+        ]))
+        story.append(customer_table)
+        story.append(Spacer(1, 5*mm))
+        
+        # Date/Time
         timestamp = job_data.get('timestamp', '')
         if timestamp:
             dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            date_str = dt.strftime('%d.%m.%Y')
-            time_str = dt.strftime('%H:%M')
+            date_time_str = dt.strftime('%d.%m.%Y kl. %H:%M')
         else:
-            date_str = 'N/A'
-            time_str = 'N/A'
+            date_time_str = 'N/A'
         
-        plumber = job_data.get('plumber', {})
-        
-        info_data = [
-            ['Dato:', date_str],
-            ['Tid:', time_str],
-            ['Montør:', plumber.get('name', 'N/A')],
-            ['Kunde:', job_data.get('customer', 'N/A')],
-        ]
-        
-        # Add start/end time if present
-        if job_data.get('startTime'):
-            info_data.append(['Starttid:', job_data.get('startTime')])
-        if job_data.get('endTime'):
-            info_data.append(['Sluttid:', job_data.get('endTime')])
-        if job_data.get('kilometers'):
-            info_data.append(['Kjørt distanse:', f"{job_data.get('kilometers')} km"])
-        
-        info_table = Table(info_data, colWidths=[40*mm, 130*mm])
-        info_table.setStyle(TableStyle([
-            ('FONT', (0, 0), (0, -1), 'Helvetica-Bold', 9),
-            ('FONT', (1, 0), (1, -1), 'Helvetica', 10),
-            ('TEXTCOLOR', (0, 0), (0, -1), HexColor('#666666')),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 3*mm)
-        ]))
-        story.append(info_table)
+        story.append(Paragraph("DATO / TID", self.styles['FieldLabel']))
+        story.append(Paragraph(date_time_str, self.styles['FieldValue']))
         story.append(Spacer(1, 5*mm))
         
-        # Job description
+        # Work description
         job_desc = job_data.get('jobDescription', '')
         if job_desc:
-            story.append(Paragraph("Beskrivelse", self.styles['SectionHeader']))
+            story.append(Paragraph("<i>ARBEID UTFØRT</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
             story.append(Paragraph(job_desc, self.styles['Normal']))
-            story.append(Spacer(1, 4*mm))
+            story.append(Spacer(1, 5*mm))
+        
+        # Time and distance
+        if job_data.get('startTime') or job_data.get('endTime') or job_data.get('kilometers'):
+            time_dist_data = []
+            if job_data.get('startTime'):
+                time_dist_data.append(['Starttid:', job_data.get('startTime')])
+            if job_data.get('endTime'):
+                time_dist_data.append(['Sluttid:', job_data.get('endTime')])
+            if job_data.get('kilometers'):
+                time_dist_data.append(['Kjørt distanse:', f"{job_data.get('kilometers')} km"])
+            
+            if time_dist_data:
+                time_table = Table(time_dist_data, colWidths=[40*mm, 130*mm])
+                time_table.setStyle(TableStyle([
+                    ('FONT', (0, 0), (0, -1), 'Helvetica', 9),
+                    ('FONT', (1, 0), (1, -1), 'Helvetica-Bold', 10),
+                    ('TEXTCOLOR', (0, 0), (0, -1), HexColor('#666666')),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2*mm)
+                ]))
+                story.append(time_table)
+                story.append(Spacer(1, 5*mm))
         
         # Materials
         materials = job_data.get('materials', [])
         if materials:
-            story.append(Paragraph("Materialer brukt", self.styles['SectionHeader']))
+            story.append(Paragraph("<i>MATERIALER BRUKT</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
             materials_text = ", ".join(materials)
             story.append(Paragraph(materials_text, self.styles['Normal']))
-            story.append(Spacer(1, 4*mm))
+            story.append(Spacer(1, 5*mm))
         
-        # Status
+        # Status section with blue header
+        story.append(Paragraph("<i>STATUS</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
+        
+        status_header = Table([['KONTROLLPUNKT']], colWidths=[170*mm])
+        status_header.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#1a3a42')),
+            ('TEXTCOLOR', (0,0), (-1,-1), HexColor('#FFFFFF')),
+            ('FONT', (0,0), (-1,-1), 'Helvetica-Bold', 10),
+            ('LEFTPADDING', (0,0), (-1,-1), 10),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5)
+        ]))
+        story.append(status_header)
+        
         answers = job_data.get('answers', {})
-        story.append(Paragraph("Status", self.styles['SectionHeader']))
-        
         status_data = [
-            ['Jobb fullført:', 'Ja' if answers.get('completed') else 'Nei'],
-            ['Materialer byttet:', 'Ja' if answers.get('materials') else 'Nei'],
-            ['Oppfølging nødvendig:', 'Ja' if answers.get('followup') else 'Nei']
+            ['Arbeid fullført'],
+            ['Materialer byttet'],
+            ['Oppfølging påkrevd']
         ]
         
-        status_table = Table(status_data, colWidths=[60*mm, 110*mm])
+        status_table = Table(status_data, colWidths=[170*mm])
         status_table.setStyle(TableStyle([
-            ('FONT', (0, 0), (0, -1), 'Helvetica', 9),
-            ('FONT', (1, 0), (1, -1), 'Helvetica-Bold', 10),
-            ('TEXTCOLOR', (0, 0), (0, -1), HexColor('#666666')),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-            ('BOTTOMPADDING', (0, 0), (-1, -1), 2*mm)
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#F5F5F5')),
+            ('BOX', (0,0), (-1,-1), 1, HexColor('#E0E0E0')),
+            ('INNERGRID', (0,0), (-1,-1), 0.5, HexColor('#E0E0E0')),
+            ('LEFTPADDING', (0,0), (-1,-1), 10),
+            ('TOPPADDING', (0,0), (-1,-1), 8),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 8),
+            ('FONT', (0,0), (-1,-1), 'Helvetica', 10)
         ]))
         story.append(status_table)
         story.append(Spacer(1, 5*mm))
         
-        # Photos - smaller in PDF
+        # Photos section
         photos_obj = job_data.get('photos', {})
         if photos_obj:
-            story.append(Paragraph("Fotodokumentasjon", self.styles['SectionHeader']))
+            story.append(Paragraph("<i>FOTODOKUMENTASJON</i>", ParagraphStyle('BlueItalic', parent=self.styles['Normal'], fontSize=11, textColor=HexColor('#1a3a42'), fontName='Helvetica-Oblique')))
             
             photo_keys = ['before', 'during', 'detail', 'after']
+            photo_labels = ['FØR — Utgangspunkt', 'ÅPENT — Under arbeid', 'DETALJ — Viktig info', 'ETTER — Ferdig resultat']
             photos = []
+            labels = []
             
-            for key in photo_keys:
+            for i, key in enumerate(photo_keys):
                 if key in photos_obj and photos_obj[key]:
                     photo_data = photos_obj[key]
                     if isinstance(photo_data, dict) and 'data' in photo_data:
                         photos.append(photo_data['data'])
+                        labels.append(photo_labels[i])
                     elif isinstance(photo_data, str):
                         photos.append(photo_data)
-            
-            for key, value in photos_obj.items():
-                if key.startswith('extra_') and value:
-                    if isinstance(value, dict) and 'data' in value:
-                        photos.append(value['data'])
-                    elif isinstance(value, str):
-                        photos.append(value)
+                        labels.append(photo_labels[i])
             
             if photos:
                 photo_rows = []
                 for i in range(0, len(photos), 2):
-                    row = []
+                    img_row = []
+                    label_row = []
+                    
                     for j in range(2):
                         if i + j < len(photos):
                             try:
@@ -235,21 +252,25 @@ class PDFGenerator:
                                 img.save(img_buffer, format='JPEG', quality=85)
                                 img_buffer.seek(0)
                                 
-                                rl_img = RLImage(img_buffer, width=75*mm, height=56*mm)
-                                row.append(rl_img)
+                                rl_img = RLImage(img_buffer, width=80*mm, height=60*mm)
+                                img_row.append(rl_img)
+                                label_row.append(Paragraph(f"<font size=8>{labels[i + j]}</font>", ParagraphStyle('Center', alignment=TA_CENTER)))
                             except Exception as e:
-                                print(f"[ERROR] Photo processing: {e}")
-                                row.append(Paragraph("Bilde feil", self.styles['Normal']))
+                                print(f"[ERROR] Photo: {e}")
+                                img_row.append('')
+                                label_row.append('')
                         else:
-                            row.append('')
+                            img_row.append('')
+                            label_row.append('')
                     
-                    if row:
-                        photo_rows.append(row)
+                    photo_rows.append(img_row)
+                    photo_rows.append(label_row)
                 
                 if photo_rows:
-                    photo_table = Table(photo_rows, colWidths=[80*mm, 80*mm])
+                    photo_table = Table(photo_rows, colWidths=[85*mm, 85*mm])
                     photo_table.setStyle(TableStyle([
                         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
                         ('LEFTPADDING', (0, 0), (-1, -1), 2*mm),
                         ('RIGHTPADDING', (0, 0), (-1, -1), 2*mm),
                         ('TOPPADDING', (0, 0), (-1, -1), 2*mm),
@@ -263,12 +284,6 @@ class PDFGenerator:
             story.append(Spacer(1, 5*mm))
             story.append(Paragraph("Merknader", self.styles['SectionHeader']))
             story.append(Paragraph(notes, self.styles['Normal']))
-        
-        # Blue footer bar
-        story.append(Spacer(1, 5*mm))
-        footer_bar = Table([['']], colWidths=[170*mm], rowHeights=[3*mm])
-        footer_bar.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), HexColor('#235774'))]))
-        story.append(footer_bar)
         
         doc.build(story)
         buffer.seek(0)
