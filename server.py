@@ -479,14 +479,98 @@ class PipelineHandler(BaseHTTPRequestHandler):
             self._json({'error': str(e)}, 500)
     
     def _send_report_email(self, data, report_id):
-        """Helper to send email for hazard and regular reports"""
+        """Helper to send email for hazard and regular reports with PDF"""
         try:
-            office_email = data.get('officeEmail', '').strip() or CONFIG['default_office_email']
-            if office_email and '@' in office_email:
-                worker_name = data.get('worker', {}).get('name', 'Ukjent')
-                subject = f"Rapport {report_id[:8]} - {worker_name}"
-                body = f"Ny rapport mottatt.\n\nType: {data.get('report_type', 'ukjent')}\nArbeider: {worker_name}\nTidspunkt: {data.get('timestamp', 'N/A')}\n"
-                self.email_sender.send(to_email=office_email, subject=subject, body=body)
+            # Find email from multiple possible locations
+            office_email = (
+                data.get('officeEmail', '').strip() or
+                data.get('site', {}).get('office_email', '').strip() or
+                data.get('site', {}).get('manager_email', '').strip() or
+                CONFIG['default_office_email']
+            )
+            
+            if not office_email or '@' not in office_email:
+                print(f"[EMAIL] No valid email found for report {report_id[:8]}")
+                return
+            
+            worker_name = data.get('worker', {}).get('name', 'Ukjent') if isinstance(data.get('worker'), dict) else 'Ukjent'
+            site_name = data.get('site', {}).get('name', 'Ukjent') if isinstance(data.get('site'), dict) else 'Ukjent'
+            report_type = data.get('report_type', 'ukjent')
+            hazard = data.get('hazard', {})
+            
+            subject = f"{'⚠️ FAREMELDING' if report_type == 'fare' else 'Vernerunde-rapport'} - {site_name} - {worker_name}"
+            
+            body = f"""Ny rapport mottatt.
+
+Type: {report_type.upper()}
+Byggeplass: {site_name}
+Arbeider: {worker_name}
+Tidspunkt: {data.get('timestamp', 'N/A')[:19].replace('T', ' ')}
+"""
+            if report_type == 'fare' and hazard:
+                body += f"""
+--- FAREDETALJER ---
+Type fare: {hazard.get('type', 'Ikke oppgitt')}
+Alvorlighetsgrad: {hazard.get('severity', 'Ikke oppgitt')}
+Beskrivelse: {hazard.get('description', 'Ingen')}
+Umiddelbare tiltak: {hazard.get('immediate_action', 'Ingen')}
+"""
+            
+            body += f"""
+Rapport-ID: {report_id[:8]}
+
+---
+Automatisk generert av Vernevakt
+"""
+            
+            # Try to generate PDF
+            attachments = []
+            try:
+                # Build a format the PDF generator understands
+                pdf_data = {
+                    'id': report_id,
+                    'timestamp': data.get('timestamp', ''),
+                    'customer': site_name,
+                    'jobDescription': f"{'Faremelding: ' + hazard.get('description', '') if report_type == 'fare' else 'Vernerunde - ' + report_type}",
+                    'company': {
+                        'name': data.get('site', {}).get('company', 'Vernevakt'),
+                        'orgNr': '',
+                        'phone': '',
+                        'email': office_email,
+                    },
+                    'plumber': {'name': worker_name},
+                    'answers': {
+                        'completed': True,
+                        'materials': False,
+                        'followup': report_type == 'fare',
+                    },
+                    'location': data.get('gps', {}),
+                    'photos': {},
+                }
+                
+                # Add photos if present
+                photos = data.get('photos', [])
+                photo_keys = ['before', 'during', 'detail', 'after']
+                for idx, photo in enumerate(photos[:4]):
+                    if photo:
+                        pdf_data['photos'][photo_keys[idx]] = {'data': photo}
+                
+                pdf_bytes = self.pdf_generator.generate(pdf_data)
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                pdf_filename = f"rapport_{timestamp}.pdf"
+                attachments.append((pdf_filename, pdf_bytes))
+                print(f"[EMAIL] PDF generated for {report_id[:8]}")
+            except Exception as pdf_err:
+                print(f"[EMAIL] PDF generation failed: {pdf_err}")
+            
+            self.email_sender.send(
+                to_email=office_email,
+                subject=subject,
+                body=body,
+                attachments=attachments if attachments else None
+            )
+            print(f"[EMAIL] Sent to {office_email}")
+            
         except Exception as e:
             print(f"[EMAIL] Helper error: {e}")
     
@@ -541,16 +625,15 @@ class PipelineHandler(BaseHTTPRequestHandler):
             job_desc = data.get('jobDescription', '')
             notes = data.get('notes', '')
             
-            office_email = data.get('officeEmail', '').strip()
+            office_email = (
+                data.get('officeEmail', '').strip() or
+                data.get('site', {}).get('office_email', '').strip() or
+                CONFIG['default_office_email']
+            )
             
-            # SAFETY: No fallback. If no valid email provided, reject.
             if not office_email or '@' not in office_email:
-                self._json({
-                    'success': False,
-                    'error': 'Ingen gyldig e-postadresse oppgitt. Rapporten ble IKKE sendt.'
-                }, 400)
-                print(f"[JOB] REJECTED - No valid email provided")
-                return
+                print(f"[JOB] WARNING - No valid email, report saved but not sent")
+                # Still process the report, just skip email
             
             subject = f"Jobbrapport - {customer or plumber.get('name', 'Ukjent')} - {timestamp[:8]}"
             body = f"""Ny jobbrapport mottatt.
@@ -592,7 +675,7 @@ Automatisk generert av VVS Dokumentasjon
             
             # Send email
             email_sent = False
-            if office_email:
+            if office_email and '@' in office_email:
                 print(f"[JOB] Sending to {office_email}...")
                 email_sent = self.email_sender.send(
                     to_email=office_email,
