@@ -254,7 +254,7 @@ class EmailSender:
         
         try:
             msg = MIMEMultipart()
-            msg['From'] = f"Right Flow VVS <{self.config['user']}>"
+            msg['From'] = f"Vernevakt <{self.config['user']}>"
             msg['To'] = to_email
             msg['Subject'] = subject
             msg.attach(MIMEText(body, 'plain', 'utf-8'))
