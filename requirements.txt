@@ -1,2 +1,4 @@
-reportlab
-Pillow
+reportlab==4.1.0
+pillow>=10.4.0
+requests==2.31.0
+psycopg[binary]>=3.1.0
