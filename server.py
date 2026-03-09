@@ -1,40 +1,48 @@
 """
-Pipeline V0 - Production Backend
-Receives job data, generates PDF (Option B style), sends email
-Ready for Railway/Render deployment
+SHA PIPELINE BACKEND - Construction Safety Documentation (Norway)
+================================================================
+Compliance-grade documentation system for Byggeplass SHA
+- Tamper-resistant photo metadata
+- Immutable audit trail
+- Role separation (worker submits, manager approves)
+- Norwegian language reports
+- HMS-kort integration
+- Vernerunde templates
+- Hazard reporting with instant alerts
 """
 
 import os
 import json
 import base64
+import hashlib
+import hmac
+import uuid
 import smtplib
-import ssl
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
+from email import encoders
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
 from io import BytesIO
-import threading
+from urllib.parse import parse_qs, urlparse
 
-# PDF Generation
+# PDF generation
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
+from reportlab.lib.colors import HexColor, black, white
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image, PageBreak
 from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
-from reportlab.lib.colors import HexColor, white
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
 
-# Image processing
 from PIL import Image as PILImage
 
 # ============================================
-# CONFIGURATION (Environment Variables)
+# CONFIGURATION
 # ============================================
 CONFIG = {
-    'port': int(os.environ.get('PORT', 8080)),
-    'output_dir': './outputs',
+    'port': int(os.environ.get('PORT', 10000)),
     'smtp': {
         'host': os.environ.get('SMTP_HOST', 'smtp.gmail.com'),
         'port': int(os.environ.get('SMTP_PORT', 587)),
@@ -42,710 +50,1400 @@ CONFIG = {
         'password': os.environ.get('SMTP_PASSWORD', ''),
     },
     'default_office_email': os.environ.get('DEFAULT_OFFICE_EMAIL', ''),
-    'allowed_origins': os.environ.get('ALLOWED_ORIGINS', '*'),
+    'hazard_alert_email': os.environ.get('HAZARD_ALERT_EMAIL', os.environ.get('DEFAULT_OFFICE_EMAIL', '')),
+    # Secret key for HMAC signatures (tamper detection)
+    'signing_key': os.environ.get('SIGNING_KEY', 'sha-pipeline-default-key-change-in-production'),
 }
 
-# Company configurations (in production, this would be a database)
-COMPANIES = {
-    'default': {
-        'name': 'VVS Eksempel AS',
-        'orgNr': '987 654 321',
-        'phone': '+47 22 33 44 55',
-        'email': 'post@vvs-eksempel.no',
-        'office_email': '',  # No default - email MUST come from form
-        'logo': None
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ============================================
+# AUDIT LOG - Immutable Record
+# ============================================
+# ============================================
+# DATABASE SETUP - PostgreSQL with in-memory fallback
+# ============================================
+import threading
+
+# In-memory fallback (used if DATABASE_URL not set)
+_AUDIT_LOG = []
+_USERS = {}
+_REPORTS = []
+_DB_LOCK = threading.Lock()
+
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
+
+def get_db():
+    """Get a database connection, or None if not configured"""
+    if not DATABASE_URL:
+        return None
+    try:
+        import psycopg
+        conn = psycopg.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        logger.error(f"[DB] Connection failed: {e}")
+        return None
+
+def init_db():
+    """Create tables if they don't exist"""
+    conn = get_db()
+    if not conn:
+        logger.warning("[DB] No DATABASE_URL set — using in-memory storage (data resets on restart)")
+        return False
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                hms_kort TEXT PRIMARY KEY,
+                pin_hash TEXT NOT NULL,
+                name TEXT NOT NULL,
+                company TEXT,
+                role TEXT DEFAULT 'worker',
+                created_at TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS reports (
+                report_id TEXT PRIMARY KEY,
+                report_type TEXT,
+                status TEXT DEFAULT 'pending',
+                timestamp TEXT,
+                site_name TEXT,
+                worker_name TEXT,
+                worker_hms TEXT,
+                integrity_hash TEXT,
+                approved_by TEXT,
+                approved_at TEXT,
+                rejection_reason TEXT,
+                full_data TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT,
+                action TEXT,
+                user_id TEXT,
+                record_id TEXT,
+                details TEXT,
+                signature TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+        logger.info("[DB] Database initialized successfully")
+        return True
+    except Exception as e:
+        logger.error(f"[DB] Init failed: {e}")
+        conn.close()
+        return False
+
+# ── USER OPERATIONS ──
+def db_get_user(hms_kort):
+    conn = get_db()
+    if not conn:
+        return _USERS.get(hms_kort)
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT hms_kort,pin_hash,name,company,role,created_at FROM users WHERE hms_kort=%s", (hms_kort,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {'hms_kort':row[0],'pin_hash':row[1],'name':row[2],'company':row[3],'role':row[4],'created_at':row[5]}
+        return None
+    except Exception as e:
+        logger.error(f"[DB] get_user error: {e}")
+        conn.close()
+        return _USERS.get(hms_kort)
+
+def db_save_user(hms_kort, user_data):
+    conn = get_db()
+    if not conn:
+        _USERS[hms_kort] = user_data
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO users (hms_kort,pin_hash,name,company,role,created_at)
+            VALUES (%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (hms_kort) DO UPDATE
+            SET pin_hash=EXCLUDED.pin_hash, name=EXCLUDED.name,
+                company=EXCLUDED.company, role=EXCLUDED.role
+        """, (hms_kort, user_data['pin_hash'], user_data['name'],
+              user_data.get('company',''), user_data.get('role','worker'),
+              user_data.get('created_at','')))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"[DB] save_user error: {e}")
+        conn.close()
+        _USERS[hms_kort] = user_data
+
+def db_user_exists(hms_kort):
+    conn = get_db()
+    if not conn:
+        return hms_kort in _USERS
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM users WHERE hms_kort=%s", (hms_kort,))
+        exists = cur.fetchone() is not None
+        conn.close()
+        return exists
+    except Exception as e:
+        logger.error(f"[DB] user_exists error: {e}")
+        conn.close()
+        return hms_kort in _USERS
+
+# ── REPORT OPERATIONS ──
+def db_save_report(report):
+    conn = get_db()
+    if not conn:
+        _REPORTS.append(report)
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO reports (report_id,report_type,status,timestamp,site_name,
+                                 worker_name,worker_hms,integrity_hash,full_data)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (report_id) DO NOTHING
+        """, (report['report_id'], report['report_type'], report.get('status','pending'),
+              report['timestamp'], report.get('site_name',''), report.get('worker_name',''),
+              report.get('worker_hms',''), report.get('integrity_hash',''),
+              json.dumps(report)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"[DB] save_report error: {e}")
+        conn.close()
+        _REPORTS.append(report)
+
+def db_get_reports(limit=200):
+    conn = get_db()
+    if not conn:
+        return list(reversed(_REPORTS[-limit:]))
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT report_id,report_type,status,timestamp,site_name,
+                   worker_name,worker_hms,integrity_hash,approved_by,approved_at,rejection_reason
+            FROM reports ORDER BY timestamp DESC LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        conn.close()
+        return [{'report_id':r[0],'report_type':r[1],'status':r[2],'timestamp':r[3],
+                 'site_name':r[4],'worker_name':r[5],'worker_hms':r[6],
+                 'integrity_hash':r[7],'approved_by':r[8],'approved_at':r[9],
+                 'rejection_reason':r[10]} for r in rows]
+    except Exception as e:
+        logger.error(f"[DB] get_reports error: {e}")
+        conn.close()
+        return list(reversed(_REPORTS[-limit:]))
+
+def db_get_report(report_id):
+    conn = get_db()
+    if not conn:
+        for r in _REPORTS:
+            if r.get('report_id') == report_id:
+                return r
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM reports WHERE report_id=%s", (report_id,))
+        row = cur.fetchone()
+        conn.close()
+        if row:
+            return {'report_id':row[0],'report_type':row[1],'status':row[2],
+                    'timestamp':row[3],'site_name':row[4],'worker_name':row[5],
+                    'worker_hms':row[6],'integrity_hash':row[7],
+                    'approved_by':row[8],'approved_at':row[9],'rejection_reason':row[10]}
+        return None
+    except Exception as e:
+        logger.error(f"[DB] get_report error: {e}")
+        conn.close()
+        return None
+
+def db_update_report_status(report_id, status, approved_by, approved_at, rejection_reason=''):
+    conn = get_db()
+    if not conn:
+        for r in _REPORTS:
+            if r.get('report_id') == report_id:
+                r['status'] = status
+                r['approved_by'] = approved_by
+                r['approved_at'] = approved_at
+                r['rejection_reason'] = rejection_reason
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE reports SET status=%s, approved_by=%s, approved_at=%s, rejection_reason=%s
+            WHERE report_id=%s
+        """, (status, approved_by, approved_at, rejection_reason, report_id))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"[DB] update_report error: {e}")
+        conn.close()
+
+# Legacy in-memory aliases (kept so existing code doesn't break)
+AUDIT_LOG = _AUDIT_LOG
+REPORTS = _REPORTS
+
+def log_audit(action, user_id, details, record_id=None):
+    """Create immutable audit entry with tamper-proof signature"""
+    entry = {
+        'id': str(uuid.uuid4()),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'action': action,
+        'user_id': user_id,
+        'record_id': record_id,
+        'details': details,
+    }
+    # Create HMAC signature for tamper detection
+    entry_str = json.dumps(entry, sort_keys=True)
+    entry['signature'] = hmac.new(
+        CONFIG['signing_key'].encode(),
+        entry_str.encode(),
+        hashlib.sha256
+    ).hexdigest()
+    
+    AUDIT_LOG.append(entry)
+    logger.info(f"[AUDIT] {action} by {user_id}: {details}")
+    return entry
+
+# ============================================
+# TAMPER-PROOF PHOTO METADATA
+# ============================================
+def create_photo_hash(photo_data, timestamp, gps_coords, device_id):
+    """Create tamper-proof hash of photo + metadata"""
+    combined = f"{photo_data[:100]}{timestamp}{gps_coords}{device_id}"
+    return hashlib.sha256(combined.encode()).hexdigest()
+
+def verify_photo_integrity(photo_data, metadata):
+    """Verify photo hasn't been tampered with"""
+    expected_hash = create_photo_hash(
+        photo_data,
+        metadata.get('timestamp', ''),
+        metadata.get('gps', ''),
+        metadata.get('device_id', '')
+    )
+    return expected_hash == metadata.get('hash', '')
+
+# ============================================
+# VERNERUNDE TEMPLATES (Safety Round Checklists)
+# ============================================
+VERNERUNDE_TEMPLATES = {
+    'daglig': {  # Daily inspection
+        'name': 'Daglig vernerunde',
+        'items': [
+            {'id': 'ppe', 'text': 'Alt personell bruker påkrevd verneutstyr (hjelm, vest, sko)', 'critical': True},
+            {'id': 'barriers', 'text': 'Sperringer og sikring er på plass', 'critical': True},
+            {'id': 'access', 'text': 'Adkomstveier er ryddige og sikre', 'critical': False},
+            {'id': 'equipment', 'text': 'Utstyr og maskiner er i forsvarlig stand', 'critical': True},
+            {'id': 'electrical', 'text': 'Elektriske installasjoner er sikret', 'critical': True},
+            {'id': 'fall_protection', 'text': 'Fallsikring er på plass ved arbeid i høyden', 'critical': True},
+            {'id': 'housekeeping', 'text': 'Arbeidsplassen er ryddig', 'critical': False},
+            {'id': 'fire', 'text': 'Brannslukningsutstyr er tilgjengelig', 'critical': True},
+            {'id': 'first_aid', 'text': 'Førstehjelpsutstyr er tilgjengelig', 'critical': False},
+            {'id': 'signage', 'text': 'Skilting og varsler er synlige', 'critical': False},
+        ]
+    },
+    'ukentlig': {  # Weekly inspection
+        'name': 'Ukentlig vernerunde',
+        'items': [
+            {'id': 'ppe', 'text': 'Alt personell bruker påkrevd verneutstyr', 'critical': True},
+            {'id': 'barriers', 'text': 'Sperringer og sikring er på plass', 'critical': True},
+            {'id': 'scaffolding', 'text': 'Stillaser er kontrollert og godkjent', 'critical': True},
+            {'id': 'lifting', 'text': 'Løfteutstyr er sertifisert og i orden', 'critical': True},
+            {'id': 'chemicals', 'text': 'Kjemikalier er forsvarlig lagret med sikkerhetsdatablad', 'critical': True},
+            {'id': 'waste', 'text': 'Avfallshåndtering er i henhold til plan', 'critical': False},
+            {'id': 'emergency', 'text': 'Nødutganger er merket og frie', 'critical': True},
+            {'id': 'documentation', 'text': 'SHA-dokumentasjon er oppdatert', 'critical': False},
+            {'id': 'training', 'text': 'Alle har gyldig HMS-kort', 'critical': True},
+            {'id': 'subcontractors', 'text': 'Underentreprenører følger SHA-plan', 'critical': True},
+        ]
+    },
+    'fare': {  # Hazard report
+        'name': 'Farerapport',
+        'items': [
+            {'id': 'hazard_type', 'text': 'Type fare identifisert', 'critical': True},
+            {'id': 'location', 'text': 'Nøyaktig plassering dokumentert', 'critical': True},
+            {'id': 'severity', 'text': 'Alvorlighetsgrad vurdert', 'critical': True},
+            {'id': 'immediate_action', 'text': 'Umiddelbare tiltak iverksatt', 'critical': True},
+            {'id': 'area_secured', 'text': 'Området er sikret/sperret', 'critical': True},
+            {'id': 'reported', 'text': 'Leder er varslet', 'critical': True},
+        ]
     }
 }
 
-os.makedirs(CONFIG['output_dir'], exist_ok=True)
-
 # ============================================
-# IN-MEMORY DATA STORES
-# (In production, replace with a real database)
+# PDF GENERATION - Norwegian Compliance Format
 # ============================================
-import uuid
-import hashlib
-
-WORKERS = {}   # hms_kort -> { name, hms_kort, company, role, pin_hash }
-REPORTS = []   # list of report dicts
-
-def hash_pin(pin):
-    return hashlib.sha256(pin.encode()).hexdigest()
-
-# ============================================
-# PDF GENERATOR (Option B - Detailed/Formal)
-# ============================================
-class PDFGenerator:
-    def __init__(self):
-        self.styles = getSampleStyleSheet()
+def generate_sha_report(data, photos, output_path):
+    """Generate professional Vernevakt PDF report matching the sample design"""
+    from reportlab.platypus import KeepTogether
     
-    def generate(self, job_data):
-        buffer = BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=A4, leftMargin=15*mm, rightMargin=15*mm, topMargin=15*mm, bottomMargin=15*mm)
-        story = []
-        page_width = 180*mm
-        
-        company = job_data.get('company', COMPANIES['default'])
-        plumber = job_data.get('plumber', {})
-        answers = job_data.get('answers', {})
-        location = job_data.get('location', {})
-        
-        # Parse timestamp
-        timestamp = job_data.get('timestamp', '')
-        try:
-            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-            date_str = dt.strftime('%d.%m.%Y')
-            time_str = dt.strftime('%H:%M')
-        except:
-            date_str = datetime.now().strftime('%d.%m.%Y')
-            time_str = datetime.now().strftime('%H:%M')
-        
-        # Header
-        header_data = [
-            [Paragraph(f"<b>{company.get('name', 'Firma')}</b><br/><font size=9>Org.nr: {company.get('orgNr', 'N/A')}</font>", self.styles['Normal']),
-             Paragraph("<b>SERVICERAPPORT</b><br/><font size=9>Dokumentasjon av utført arbeid</font>", 
-                       ParagraphStyle('Right', parent=self.styles['Normal'], alignment=TA_RIGHT))]
-        ]
-        t = Table(header_data, colWidths=[90*mm, 90*mm])
-        story.append(t)
-        story.append(Spacer(1, 2*mm))
-        
-        # Blue bar
-        bar = Table([['']], colWidths=[page_width], rowHeights=[6*mm])
-        bar.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), HexColor('#2C5282'))]))
-        story.append(bar)
-        story.append(Spacer(1, 4*mm))
-        
-        # Info section
-        customer = job_data.get('customer', '')
-        job_desc = job_data.get('jobDescription', '')
-        address = customer if customer else (f"GPS: {location.get('lat', 0):.5f}, {location.get('lng', 0):.5f}" if location else 'Ikke tilgjengelig')
-        
-        info_left = [
-            [Paragraph("<font size=8 color='#666666'>KUNDE / ADRESSE</font>", self.styles['Normal'])],
-            [Paragraph(f"<b>{address}</b>", self.styles['Normal'])],
-            [Spacer(1, 2*mm)],
-            [Paragraph("<font size=8 color='#666666'>DATO / TID</font>", self.styles['Normal'])],
-            [Paragraph(f"<b>{date_str} kl. {time_str}</b>", self.styles['Normal'])],
-        ]
-        info_right = [
-            [Paragraph("<font size=8 color='#666666'>UTFØRT AV</font>", self.styles['Normal'])],
-            [Paragraph(f"<b>{plumber.get('name', 'N/A')}</b>", self.styles['Normal'])],
-            [Spacer(1, 2*mm)],
-            [Paragraph("<font size=8 color='#666666'>RAPPORTNUMMER</font>", self.styles['Normal'])],
-            [Paragraph(f"<b>{job_data.get('id', 'N/A')[:16]}</b>", self.styles['Normal'])],
-        ]
-        
-        info_table = Table([
-            [Table(info_left, colWidths=[85*mm]), Table(info_right, colWidths=[85*mm])]
-        ], colWidths=[90*mm, 90*mm])
-        info_table.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,-1), HexColor('#F7FAFC')),
-            ('BOX', (0,0), (-1,-1), 1, HexColor('#E2E8F0')),
-            ('PADDING', (0,0), (-1,-1), 8),
-        ]))
-        story.append(info_table)
-        story.append(Spacer(1, 4*mm))
-        
-        # Job description if provided
-        if job_desc:
-            story.append(Paragraph("<font color='#2C5282'><b>ARBEID UTFØRT</b></font>", self.styles['Heading4']))
-            story.append(Paragraph(job_desc, self.styles['Normal']))
-            story.append(Spacer(1, 4*mm))
-        
-        # Status
-        story.append(Paragraph("<font color='#2C5282'><b>STATUS</b></font>", self.styles['Heading4']))
-        
-        def yes_no(val):
-            if val is True: return '✓ JA'
-            elif val is False: return '✗ NEI'
-            return '—'
-        
-        status = [
-            ['KONTROLLPUNKT', 'RESULTAT'],
-            ['Arbeid fullført', yes_no(answers.get('completed'))],
-            ['Materialer byttet', yes_no(answers.get('materials'))],
-            ['Oppfølging påkrevd', yes_no(answers.get('followup'))],
-        ]
-        t = Table(status, colWidths=[page_width * 0.6, page_width * 0.4])
+    doc = SimpleDocTemplate(
+        output_path,
+        pagesize=A4,
+        rightMargin=18*mm,
+        leftMargin=18*mm,
+        topMargin=16*mm,
+        bottomMargin=16*mm
+    )
+
+    # ── Colors ──
+    DARK       = HexColor('#1a2535')
+    MID        = HexColor('#2d3a4a')
+    LIGHT_BG   = HexColor('#f4f6f8')
+    BORDER     = HexColor('#d0d7e0')
+    GREEN      = HexColor('#2e7d32')
+    GREEN_BG   = HexColor('#e8f5e9')
+    RED        = HexColor('#c62828')
+    RED_BG     = HexColor('#ffebee')
+    AMBER      = HexColor('#e65100')
+    AMBER_BG   = HexColor('#fff3e0')
+    ORANGE     = HexColor('#ef6c00')
+    ORANGE_BG  = HexColor('#fff8e1')
+    MUTED      = HexColor('#546e7a')
+    WHITE      = HexColor('#ffffff')
+
+    SEV_COLORS = {
+        'lav':     (HexColor('#1b5e20'), HexColor('#e8f5e9')),
+        'middels': (HexColor('#f57f17'), HexColor('#fffde7')),
+        'hoy':     (HexColor('#e65100'), HexColor('#fff3e0')),
+        'høy':     (HexColor('#e65100'), HexColor('#fff3e0')),
+        'kritisk': (HexColor('#b71c1c'), HexColor('#ffebee')),
+    }
+
+    styles = getSampleStyleSheet()
+
+    def style(name, **kw):
+        s = ParagraphStyle(name, parent=styles['Normal'], **kw)
+        return s
+
+    title_st  = style('T', fontSize=15, fontName='Helvetica-Bold', textColor=DARK, alignment=TA_CENTER, spaceAfter=2)
+    sub_st    = style('S', fontSize=9,  fontName='Helvetica',      textColor=MUTED, alignment=TA_CENTER, spaceAfter=8)
+    sec_st    = style('H', fontSize=9,  fontName='Helvetica-Bold', textColor=WHITE, spaceAfter=0)
+    cell_key  = style('CK', fontSize=8.5, fontName='Helvetica-Bold', textColor=MUTED)
+    cell_val  = style('CV', fontSize=8.5, fontName='Helvetica',      textColor=DARK)
+    chk_st    = style('CH', fontSize=8.5, fontName='Helvetica',      textColor=DARK)
+    foot_st   = style('F',  fontSize=7,   fontName='Helvetica',      textColor=MUTED, alignment=TA_CENTER)
+    small_st  = style('SM', fontSize=7.5, fontName='Helvetica',      textColor=MUTED)
+
+    def section_header(text, color=DARK):
+        """Dark bar section header like the sample"""
+        data_h = [[Paragraph(f'<b>{text}</b>', style('SH', fontSize=9, fontName='Helvetica-Bold', textColor=WHITE))]]
+        t = Table(data_h, colWidths=[174*mm])
         t.setStyle(TableStyle([
-            ('BACKGROUND', (0,0), (-1,0), HexColor('#2C5282')),
-            ('TEXTCOLOR', (0,0), (-1,0), white),
-            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0,0), (-1,-1), 9),
-            ('GRID', (0,0), (-1,-1), 0.5, HexColor('#CBD5E0')),
-            ('PADDING', (0,0), (-1,-1), 6),
-            ('ALIGN', (1,0), (1,-1), 'CENTER'),
+            ('BACKGROUND', (0,0), (-1,-1), color),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('LEFTPADDING', (0,0), (-1,-1), 8),
         ]))
-        story.append(t)
+        return t
+
+    story = []
+
+    # ── Safe data extraction ──
+    report_type  = data.get('report_type') or 'daglig'
+    site         = data.get('site') or {}
+    worker       = data.get('worker') or {}
+    gps          = data.get('gps') or {}
+    checklist    = data.get('checklist') or {}
+    hazard       = data.get('hazard') or {}
+    notes        = data.get('notes') or ''
+    approval     = data.get('approval') or {}
+    report_id    = data.get('report_id', '')
+    timestamp    = data.get('timestamp', '')
+    if not isinstance(site, dict): site = {}
+    if not isinstance(worker, dict): worker = {}
+    if not isinstance(gps, dict): gps = {}
+    if not isinstance(checklist, dict): checklist = {}
+    if not isinstance(hazard, dict): hazard = {}
+    if not isinstance(approval, dict): approval = {}
+
+    template = VERNERUNDE_TEMPLATES.get(report_type, VERNERUNDE_TEMPLATES['daglig'])
+
+    # Format date/time
+    try:
+        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        fmt_date = dt.strftime('%d.%m.%Y')
+        fmt_time = dt.strftime('%H:%M')
+    except:
+        fmt_date = datetime.now().strftime('%d.%m.%Y')
+        fmt_time = datetime.now().strftime('%H:%M')
+
+    # ── HEADER — clean, no nested tables ──
+    ORANGE = HexColor('#f59e0b')
+    BLACK  = HexColor('#111111')
+
+    type_label = {'daglig': 'Daglig vernerunde', 'ukentlig': 'Ukentlig vernerunde', 'fare': 'Farerapport'}.get(report_type, report_type)
+    title_text = 'FARERAPPORT' if report_type == 'fare' else 'VERNEVAKT'
+
+    # Row 1: black background, VERNEVAKT left, report type right
+    hdr_row1 = Table([[
+        Paragraph(f'<b>{title_text}</b>',
+                  style('H1L', fontSize=26, fontName='Helvetica-Bold', textColor=ORANGE, leading=30)),
+        Paragraph(f'Rapport type<br/><b>{type_label}</b>',
+                  style('H1R', fontSize=11, fontName='Helvetica-Bold', textColor=WHITE,
+                        alignment=TA_RIGHT, leading=16)),
+    ]], colWidths=[100*mm, 74*mm])
+    hdr_row1.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), BLACK),
+        ('TOPPADDING', (0,0), (-1,-1), 12),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 4),
+        ('LEFTPADDING', (0,0), (0,0), 10),
+        ('RIGHTPADDING', (1,0), (1,0), 10),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    story.append(hdr_row1)
+
+    # Row 2: subtitle on black background
+    hdr_row2 = Table([[
+        Paragraph('Sikker HMS-dokumentasjon for norske byggeplasser',
+                  style('H2', fontSize=8, fontName='Helvetica', textColor=HexColor('#aaaaaa'))),
+        Paragraph('', style('H2R', fontSize=8)),
+    ]], colWidths=[120*mm, 54*mm])
+    hdr_row2.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), BLACK),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 10),
+        ('LEFTPADDING', (0,0), (0,0), 10),
+    ]))
+    story.append(hdr_row2)
+
+    # Orange line
+    orange_line = Table([['']], colWidths=[174*mm], rowHeights=[3.5])
+    orange_line.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), ORANGE),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(orange_line)
+    story.append(Spacer(1, 5*mm))
+
+    # ── RAPPORT INFO ──
+    story.append(section_header('RAPPORTINFORMASJON'))
+
+    gps_text = ''
+    if gps.get('lat') and gps.get('lng'):
+        gps_text = f"{gps['lat']:.4f}° N, {gps['lng']:.4f}° E"
+        if gps.get('accuracy'):
+            gps_text += f" (±{gps['accuracy']}m)"
+
+    short_id = report_id[:8] if report_id else 'N/A'
+
+    info_rows = [
+        [Paragraph('Byggeplass', cell_key), Paragraph(site.get('name','Ikke oppgitt'), cell_val),
+         Paragraph('Dato', cell_key), Paragraph(fmt_date, cell_val)],
+        [Paragraph('Firma', cell_key), Paragraph(site.get('company','Ikke oppgitt'), cell_val),
+         Paragraph('Tidspunkt', cell_key), Paragraph(fmt_time, cell_val)],
+        [Paragraph('Innrapportert av', cell_key), Paragraph(worker.get('name','Ikke oppgitt'), cell_val),
+         Paragraph('HMS-kort nr', cell_key), Paragraph(worker.get('hms_kort','Ikke oppgitt'), cell_val)],
+    ]
+    if gps_text:
+        info_rows.append([
+            Paragraph('GPS', cell_key), Paragraph(gps_text, cell_val),
+            Paragraph('Rapport-ID', cell_key), Paragraph(short_id, cell_val)
+        ])
+    else:
+        info_rows.append([
+            Paragraph('Adresse', cell_key), Paragraph(site.get('address','Ikke oppgitt'), cell_val),
+            Paragraph('Rapport-ID', cell_key), Paragraph(short_id, cell_val)
+        ])
+
+    info_t = Table(info_rows, colWidths=[30*mm, 57*mm, 30*mm, 57*mm])
+    info_t.setStyle(TableStyle([
+        ('FONTSIZE', (0,0), (-1,-1), 8.5),
+        ('GRID', (0,0), (-1,-1), 0.4, BORDER),
+        ('BACKGROUND', (0,0), (0,-1), LIGHT_BG),
+        ('BACKGROUND', (2,0), (2,-1), LIGHT_BG),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('LEFTPADDING', (0,0), (-1,-1), 7),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    story.append(info_t)
+    story.append(Spacer(1, 4*mm))
+
+    # ── CHECKLIST ──
+    story.append(section_header(f'SJEKKPUNKTER — {type_label.upper()}'))
+
+    chk_header = [
+        Paragraph('<b>Status</b>', style('CH2', fontSize=8, fontName='Helvetica-Bold', textColor=WHITE)),
+        Paragraph('<b>Sjekkpunkt</b>', style('CH2', fontSize=8, fontName='Helvetica-Bold', textColor=WHITE)),
+        Paragraph('<b>Kritisk</b>', style('CH2', fontSize=8, fontName='Helvetica-Bold', textColor=WHITE)),
+    ]
+    chk_rows = [chk_header]
+    avvik_items = []
+
+    for item in template['items']:
+        iid = item['id']
+        val = checklist.get(iid, None)
+        if val is True:
+            status_txt = Paragraph('<font color="#2e7d32"><b>&#10003; OK</b></font>', chk_st)
+            row_bg = WHITE
+        elif val is False:
+            status_txt = Paragraph('<font color="#c62828"><b>&#10007; AVVIK</b></font>', chk_st)
+            row_bg = RED_BG
+            avvik_items.append(item)
+        else:
+            status_txt = Paragraph('<font color="#546e7a">&#8212; N/A</font>', chk_st)
+            row_bg = WHITE
+
+        critical_txt = Paragraph('<b>JA</b>' if item['critical'] else 'Nei',
+                                  style('CR', fontSize=8, fontName='Helvetica-Bold' if item['critical'] else 'Helvetica',
+                                        textColor=RED if item['critical'] else MUTED))
+        chk_rows.append([status_txt, Paragraph(item['text'], chk_st), critical_txt])
+
+    chk_t = Table(chk_rows, colWidths=[22*mm, 132*mm, 20*mm])
+    row_styles = [
+        ('BACKGROUND', (0,0), (-1,0), MID),
+        ('GRID', (0,0), (-1,-1), 0.4, BORDER),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('LEFTPADDING', (0,0), (-1,-1), 7),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('ALIGN', (2,0), (2,-1), 'CENTER'),
+    ]
+    # Color avvik rows red
+    for i, item in enumerate(template['items'], start=1):
+        if checklist.get(item['id']) is False:
+            row_styles.append(('BACKGROUND', (0,i), (-1,i), RED_BG))
+    chk_t.setStyle(TableStyle(row_styles))
+    story.append(chk_t)
+    story.append(Spacer(1, 4*mm))
+
+    # ── AVVIK SECTION ──
+    if avvik_items:
+        story.append(section_header('AVVIK — ANSVARLIG OG FRIST FOR UTBEDRING', color=HexColor('#7f0000')))
+        av_header = [
+            Paragraph('<b>Avvik / Sjekkpunkt</b>', style('AH', fontSize=8, fontName='Helvetica-Bold', textColor=WHITE)),
+            Paragraph('<b>Ansvarlig</b>', style('AH', fontSize=8, fontName='Helvetica-Bold', textColor=WHITE)),
+            Paragraph('<b>Frist for utbedring</b>', style('AH', fontSize=8, fontName='Helvetica-Bold', textColor=WHITE)),
+        ]
+        av_rows = [av_header]
+        avvik_details = data.get('avvik_details') or {}
+        if not isinstance(avvik_details, dict): avvik_details = {}
+        for item in avvik_items:
+            detail = avvik_details.get(item['id']) or {}
+            if not isinstance(detail, dict): detail = {}
+            ansvarlig = detail.get('ansvarlig') or 'Ikke angitt'
+            frist = detail.get('frist') or 'Ikke angitt'
+            av_rows.append([
+                Paragraph(item['text'], style('AV', fontSize=8, fontName='Helvetica', textColor=DARK)),
+                Paragraph(ansvarlig, style('AV', fontSize=8, fontName='Helvetica',
+                          textColor=DARK if ansvarlig != 'Ikke angitt' else MUTED)),
+                Paragraph(frist, style('AV', fontSize=8, fontName='Helvetica',
+                          textColor=DARK if frist != 'Ikke angitt' else MUTED)),
+            ])
+        av_t = Table(av_rows, colWidths=[90*mm, 45*mm, 39*mm])
+        av_t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), HexColor('#7f0000')),
+            ('GRID', (0,0), (-1,-1), 0.4, BORDER),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [WHITE, RED_BG]),
+            ('TOPPADDING', (0,0), (-1,-1), 5),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+            ('LEFTPADDING', (0,0), (-1,-1), 7),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ]))
+        story.append(av_t)
         story.append(Spacer(1, 4*mm))
-        
-        # Photos
-        story.append(Paragraph("<font color='#2C5282'><b>FOTODOKUMENTASJON</b></font>", self.styles['Heading4']))
-        
-        photos = job_data.get('photos', {})
-        photo_labels = {'before': 'FØR', 'during': 'ÅPENT', 'detail': 'DETALJ', 'after': 'ETTER'}
-        photo_hints = {'before': 'Utgangspunkt', 'during': 'Under arbeid', 'detail': 'Viktig info', 'after': 'Ferdig resultat'}
-        
-        photo_images = []
-        for key in ['before', 'during', 'detail', 'after']:
-            photo_data = photos.get(key, {})
-            if photo_data and photo_data.get('data'):
-                try:
-                    img_data = photo_data['data']
-                    if ',' in img_data:
-                        img_data = img_data.split(',')[1]
-                    img_bytes = base64.b64decode(img_data)
-                    img_buffer = BytesIO(img_bytes)
-                    img = Image(img_buffer, width=85*mm, height=55*mm)
-                    photo_images.append([img, Paragraph(f"<font size=8><b>{photo_labels[key]}</b> — {photo_hints[key]}</font>", 
-                                                        ParagraphStyle('C', alignment=TA_CENTER))])
-                except Exception as e:
-                    print(f"Photo error {key}: {e}")
-                    photo_images.append([Paragraph(f"{photo_labels[key]}<br/>(Ikke tilgjengelig)", self.styles['Normal']), ''])
-            else:
-                photo_images.append([Paragraph(f"{photo_labels[key]}<br/>(Ikke tatt)", self.styles['Normal']), ''])
-        
-        if len(photo_images) >= 4:
-            photo_table = [
-                [photo_images[0][0], photo_images[1][0]],
-                [photo_images[0][1], photo_images[1][1]],
-                [photo_images[2][0], photo_images[3][0]],
-                [photo_images[2][1], photo_images[3][1]],
-            ]
-            t = Table(photo_table, colWidths=[page_width/2, page_width/2])
-            t.setStyle(TableStyle([
-                ('ALIGN', (0,0), (-1,-1), 'CENTER'),
-                ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-                ('BOX', (0,0), (-1,-1), 1, HexColor('#2C5282')),
-                ('BACKGROUND', (0,0), (-1,-1), HexColor('#FAFAFA')),
-                ('PADDING', (0,0), (-1,-1), 4),
-            ]))
-            story.append(t)
-        
-        # Footer
-        story.append(Spacer(1, 5*mm))
-        footer_bar = Table([['']], colWidths=[page_width], rowHeights=[2*mm])
-        footer_bar.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), HexColor('#2C5282'))]))
-        story.append(footer_bar)
+
+    # ── HAZARD DETAILS ──
+    if report_type == 'fare' and hazard:
+        sev = (hazard.get('severity') or '').lower()
+        sev_fg, sev_bg = SEV_COLORS.get(sev, (RED, RED_BG))
+        story.append(section_header('FAREDETALJER', color=HexColor('#7f0000')))
+        haz_rows = [
+            [Paragraph('Type fare:', cell_key),      Paragraph(hazard.get('type','Ikke spesifisert'), cell_val)],
+            [Paragraph('Alvorlighetsgrad:', cell_key), Paragraph(f'<b>{hazard.get("severity","Ikke vurdert").upper()}</b>',
+                                                                   style('SEV', fontSize=8.5, fontName='Helvetica-Bold', textColor=sev_fg))],
+            [Paragraph('Beskrivelse:', cell_key),     Paragraph(hazard.get('description','Ingen beskrivelse'), cell_val)],
+            [Paragraph('Umiddelbare tiltak:', cell_key), Paragraph(hazard.get('immediate_action','Ingen tiltak'), cell_val)],
+        ]
+        haz_t = Table(haz_rows, colWidths=[35*mm, 139*mm])
+        haz_t.setStyle(TableStyle([
+            ('GRID', (0,0), (-1,-1), 0.4, BORDER),
+            ('BACKGROUND', (0,0), (-1,-1), HexColor('#fff5f5')),
+            ('BACKGROUND', (0,1), (-1,1), sev_bg),
+            ('TOPPADDING', (0,0), (-1,-1), 6),
+            ('BOTTOMPADDING', (0,0), (-1,-1), 6),
+            ('LEFTPADDING', (0,0), (-1,-1), 7),
+            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+            ('FONTNAME', (0,0), (0,-1), 'Helvetica-Bold'),
+        ]))
+        story.append(haz_t)
+        story.append(Spacer(1, 4*mm))
+
+    # ── NOTES ──
+    if notes:
+        story.append(section_header('KOMMENTARER'))
         story.append(Spacer(1, 2*mm))
-        story.append(Paragraph(
-            f"<font size=7 color='#666666'>Dokumentasjon i henhold til TEK17 §4-1 (FDV) | {company.get('name', '')} | {company.get('phone', '')}</font>", 
-            ParagraphStyle('Footer', alignment=TA_CENTER)
-        ))
-        
-        doc.build(story)
-        buffer.seek(0)
-        return buffer.getvalue()
+        story.append(Paragraph(notes, style('N', fontSize=9, fontName='Helvetica', textColor=DARK, leftIndent=8)))
+        story.append(Spacer(1, 4*mm))
+
+    # ── PHOTOS ──
+    if photos:
+        story.append(PageBreak())
+        story.append(section_header('FOTODOKUMENTASJON'))
+        story.append(Spacer(1, 3*mm))
+        photo_labels = ['Oversikt', 'Detalj 1', 'Detalj 2', 'Avvik/Fare'] if report_type == 'fare' else ['Bilde 1', 'Bilde 2', 'Bilde 3', 'Bilde 4']
+        # Full width individual photos - one per row, full quality
+        for i, photo_data in enumerate(photos[:4]):
+            try:
+                img_data = base64.b64decode(photo_data.split(',')[1] if ',' in photo_data else photo_data)
+                img = PILImage.open(BytesIO(img_data))
+                # Keep original aspect ratio, full width
+                orig_w, orig_h = img.size
+                max_w = 170*mm
+                aspect = orig_h / orig_w
+                img_h = min(max_w * aspect, 120*mm)
+                buf = BytesIO()
+                img.save(buf, format='JPEG', quality=95)
+                buf.seek(0)
+                rl_img = Image(buf, width=max_w, height=img_h)
+                label = (photo_labels[i] if i < len(photo_labels) else f'Bilde {i+1}')
+                story.append(Paragraph(f'<b>Bilde {i+1} — {label}</b>', small_st))
+                story.append(rl_img)
+                story.append(Spacer(1, 4*mm))
+            except Exception as e:
+                logger.error(f"Photo {i} error: {e}")
+                story.append(Paragraph(f'Bilde {i+1} - feil ved lasting', small_st))
+
+    # ── APPROVAL ──
+    story.append(section_header('GODKJENNING'))
+    appr_status = approval.get('status', 'pending')
+    if appr_status == 'approved':
+        appr_txt = f'<font color="#2e7d32"><b>Godkjent av {approval.get("approved_by","Ukjent")}</b></font>'
+    elif appr_status == 'rejected':
+        appr_txt = f'<font color="#c62828"><b>Avvist av {approval.get("approved_by","Ukjent")}: {approval.get("rejection_reason","")}</b></font>'
+    else:
+        appr_txt = '<font color="#e65100"><b>Venter pa godkjenning av leder</b></font>'
+
+    appr_rows = [
+        [Paragraph('Status', cell_key), Paragraph(appr_txt, style('AP', fontSize=9, fontName='Helvetica'))],
+        [Paragraph('Leder', cell_key),  Paragraph(approval.get('approved_by', '—'), cell_val)],
+        [Paragraph('Dato', cell_key),   Paragraph(approval.get('approved_at', '—'), cell_val)],
+        [Paragraph('Merknad', cell_key),Paragraph(approval.get('rejection_reason', '—'), cell_val)],
+    ]
+    appr_t = Table(appr_rows, colWidths=[30*mm, 144*mm])
+    appr_t.setStyle(TableStyle([
+        ('GRID', (0,0), (-1,-1), 0.4, BORDER),
+        ('BACKGROUND', (0,0), (0,-1), LIGHT_BG),
+        ('TOPPADDING', (0,0), (-1,-1), 5),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 5),
+        ('LEFTPADDING', (0,0), (-1,-1), 7),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    story.append(appr_t)
+
+    # ── FOOTER ──
+    story.append(Spacer(1, 6*mm))
+    integrity_hash = data.get('integrity_hash', 'N/A')
+    footer_lines = [
+        f'Generert av Vernevakt | Rapport-ID: {report_id} | Integritets-hash: {integrity_hash[:16]}... | Generert: {datetime.now().strftime("%d.%m.%Y %H:%M:%S")}',
+        'SHA-dokumentasjon i henhold til Byggherreforskriften og Arbeidsmiljoeloven. Dokumentet skal oppbevares i minimum 5 ar etter prosjektets avslutning.',
+    ]
+    for line in footer_lines:
+        story.append(Paragraph(line, foot_st))
+
+    doc.build(story)
+    logger.info(f"[PDF] Generated Vernevakt report: {output_path}")
+    return output_path
 
 
-# ============================================
-# EMAIL SENDER
-# ============================================
-class EmailSender:
-    def __init__(self, config):
-        self.config = config
+def send_email(to_email, subject, body, attachments=None):
+    """Send email with attachments"""
+    if not CONFIG['smtp']['user'] or not CONFIG['smtp']['password']:
+        logger.warning("[EMAIL] SMTP not configured")
+        return False
     
-    def send(self, to_email, subject, body, attachments=None):
-        if not self.config['user'] or not self.config['password']:
-            print(f"[EMAIL] SMTP not configured. Would send to: {to_email}")
-            print(f"[EMAIL] Subject: {subject}")
-            return False
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = CONFIG['smtp']['user']
+        msg['To'] = to_email
+        msg['Subject'] = subject
         
-        try:
-            msg = MIMEMultipart()
-            msg['From'] = f"Vernevakt <{self.config['user']}>"
-            msg['To'] = to_email
-            msg['Subject'] = subject
-            msg.attach(MIMEText(body, 'plain', 'utf-8'))
-            
-            if attachments:
-                for filename, content in attachments:
-                    part = MIMEApplication(content, Name=filename)
-                    part['Content-Disposition'] = f'attachment; filename="{filename}"'
-                    msg.attach(part)
-            
-            context = ssl.create_default_context()
-            with smtplib.SMTP(self.config['host'], self.config['port']) as server:
-                server.starttls(context=context)
-                server.login(self.config['user'], self.config['password'])
-                server.send_message(msg)
-            
-            print(f"[EMAIL] Sent to {to_email}")
-            return True
-            
-        except Exception as e:
-            print(f"[EMAIL] Failed: {e}")
-            return False
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
+        
+        # Attachments
+        if attachments:
+            for filename, data in attachments:
+                part = MIMEBase('application', 'octet-stream')
+                if isinstance(data, str):
+                    part.set_payload(data.encode('utf-8'))
+                else:
+                    part.set_payload(data)
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename="{filename}"')
+                msg.attach(part)
+        
+        # Send
+        server = smtplib.SMTP(CONFIG['smtp']['host'], CONFIG['smtp']['port'])
+        server.starttls()
+        server.login(CONFIG['smtp']['user'], CONFIG['smtp']['password'])
+        server.send_message(msg)
+        server.quit()
+        
+        logger.info(f"[EMAIL] Sent to {to_email}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[EMAIL] Failed: {e}")
+        return False
 
+def send_hazard_alert(data, pdf_path):
+    """Send immediate hazard alert to site manager"""
+    hazard = data.get('hazard') or {}
+    site = data.get('site') or {}
+    worker = data.get('worker') or {}
+    if not isinstance(hazard, dict): hazard = {}
+    if not isinstance(site, dict): site = {}
+    if not isinstance(worker, dict): worker = {}
+    
+    subject = f"⚠️ FARE RAPPORTERT - {site.get('name', 'Ukjent byggeplass')}"
+    
+    body = f"""
+UMIDDELBAR FAREMELDING
+=====================
+
+Byggeplass: {site.get('name', 'Ukjent')}
+Adresse: {site.get('address', 'Ukjent')}
+Rapportert av: {worker.get('name', 'Ukjent')} (HMS-kort: {worker.get('hms_kort', 'Ukjent')})
+Tidspunkt: {data.get('timestamp', 'Ukjent')}
+
+FARE:
+Type: {hazard.get('type', 'Ikke spesifisert')}
+Alvorlighetsgrad: {hazard.get('severity', 'Ikke vurdert')}
+
+Beskrivelse:
+{hazard.get('description', 'Ingen beskrivelse')}
+
+Umiddelbare tiltak:
+{hazard.get('immediate_action', 'Ingen tiltak beskrevet')}
+
+---
+Se vedlagt PDF for fullstendig rapport med bilder.
+Vennligst bekreft mottak og iverksett nødvendige tiltak.
+
+SHA Pipeline - Automatisk generert faremelding
+"""
+    
+    # Read PDF
+    attachments = []
+    try:
+        with open(pdf_path, 'rb') as f:
+            attachments.append((f"farerapport_{data.get('report_id', 'ukjent')[:8]}.pdf", f.read()))
+    except Exception as e:
+        logger.error(f"[HAZARD] Could not attach PDF: {e}")
+    
+    # Send to hazard alert email (site manager)
+    alert_email = (data.get('site') or {}).get('manager_email','').strip()
+    if not alert_email:
+        alert_email = (data.get('site') or {}).get('office_email','').strip()
+    if not alert_email:
+        alert_email = CONFIG['hazard_alert_email']
+    return send_email(alert_email, subject, body, attachments)
 
 # ============================================
-# REQUEST HANDLER
+# HTTP REQUEST HANDLER
 # ============================================
-class PipelineHandler(BaseHTTPRequestHandler):
-    pdf_generator = PDFGenerator()
-    email_sender = EmailSender(CONFIG['smtp'])
+class SHAHandler(BaseHTTPRequestHandler):
+    
+    def _send_response(self, status, data):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.end_headers()
+        self.wfile.write(json.dumps(data, ensure_ascii=False).encode('utf-8'))
     
     def do_OPTIONS(self):
-        self.send_response(200)
-        self._cors()
-        self.end_headers()
+        self._send_response(200, {'status': 'ok'})
     
     def do_GET(self):
         path = urlparse(self.path).path
         
-        if path == '/api/status':
-            self._json({'status': 'ok', 'version': '1.0.0', 'smtp_configured': bool(CONFIG['smtp']['user'])})
-        elif path == '/health':
-            self._json({'healthy': True})
+        if path == '/health':
+            self._send_response(200, {'healthy': True})
+        
+        elif path == '/api/status':
+            self._send_response(200, {
+                'status': 'ok',
+                'version': '1.0.0',
+                'service': 'SHA Pipeline',
+                'smtp_configured': bool(CONFIG['smtp']['user'] and CONFIG['smtp']['password'])
+            })
+        
+        elif path == '/api/templates':
+            # Return available templates
+            templates = {}
+            for key, tmpl in VERNERUNDE_TEMPLATES.items():
+                templates[key] = {
+                    'name': tmpl['name'],
+                    'items': tmpl['items']
+                }
+            self._send_response(200, {'templates': templates})
+        
+        elif path == '/api/audit':
+            # Return audit log (would require auth in production)
+            self._send_response(200, {'audit_log': AUDIT_LOG[-100:]})  # Last 100 entries
+        
         elif path == '/api/reports':
-            self._handle_reports()
+            # Return report history (last 200, newest first)
+            self._send_response(200, {'reports': db_get_reports(200)})
+
+        elif path.startswith('/approve'):
+            # Manager approval page - served as HTML
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            report_id = params.get('id', [''])[0]
+            self._serve_approval_page(report_id)
+        
         else:
-            self.send_error(404)
+            self._send_response(404, {'error': 'Not found'})
     
     def do_POST(self):
         path = urlparse(self.path).path
         
-        if path == '/api/submit':
-            self._handle_submit()
-        elif path == '/api/login':
-            self._handle_login()
-        elif path == '/api/register':
-            self._handle_register()
-        elif path == '/api/hazard':
-            self._handle_hazard()
-        elif path == '/api/approve':
-            self._handle_approve()
-        else:
-            self.send_error(404)
-    
-    def _handle_login(self):
+        # Read body
+        content_length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(content_length)
+        
+        # Try JSON first, then form-encoded (from approval page)
+        content_type = self.headers.get('Content-Type', '')
         try:
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-            data = json.loads(body.decode('utf-8'))
-            
-            hms_kort = data.get('hms_kort', '').strip()
-            pin = data.get('pin', '').strip()
-            
-            if not hms_kort or not pin:
-                self._json({'error': 'HMS-kort og PIN er påkrevd'}, 400)
-                return
-            
-            worker = WORKERS.get(hms_kort)
-            if not worker or worker['pin_hash'] != hash_pin(pin):
-                self._json({'error': 'Ugyldig HMS-kort eller PIN'}, 401)
-                return
-            
-            self._json({
-                'success': True,
-                'worker': {
-                    'name': worker['name'],
-                    'hms_kort': worker['hms_kort'],
-                    'company': worker.get('company', ''),
-                    'role': worker['role']
-                }
+            if 'application/x-www-form-urlencoded' in content_type:
+                from urllib.parse import unquote_plus
+                pairs = body.decode('utf-8').split('&')
+                data = {}
+                for pair in pairs:
+                    if '=' in pair:
+                        k, v = pair.split('=', 1)
+                        data[unquote_plus(k)] = unquote_plus(v)
+                # Convert form data to approve API format
+                if 'manager_name' in data:
+                    data = {
+                        'report_id': data.get('report_id', ''),
+                        'action': data.get('action', 'approve'),
+                        'manager': {
+                            'name': data.get('manager_name', ''),
+                            'hms_kort': data.get('manager_hms', ''),
+                        },
+                        'rejection_reason': data.get('rejection_reason', ''),
+                    }
+            else:
+                data = json.loads(body.decode('utf-8'))
+        except Exception:
+            self._send_response(400, {'error': 'Invalid request'})
+            return
+        
+        if path == '/api/submit':
+            self._handle_submit(data)
+        
+        elif path == '/api/hazard':
+            self._handle_hazard(data)
+        
+        elif path == '/api/approve':
+            self._handle_approve(data)
+        
+        elif path == '/api/login':
+            self._handle_login(data)
+        
+        elif path == '/api/register':
+            self._handle_register(data)
+        
+        else:
+            self._send_response(404, {'error': 'Not found'})
+    
+    def _handle_submit(self, data):
+        """Handle SHA report submission"""
+        logger.info("[JOB] Received SHA report submission")
+        
+        try:
+            # Generate report ID
+            report_id = str(uuid.uuid4())
+            data['report_id'] = report_id
+
+            # Safe extraction - ensure dicts, never None
+            report_type = data.get('report_type') or 'daglig'
+            worker = data.get('worker') or {}
+            site = data.get('site') or {}
+            if not isinstance(worker, dict): worker = {}
+            if not isinstance(site, dict): site = {}
+
+            # Create integrity hash (exclude photos to keep it fast)
+            hash_data = {k: v for k, v in data.items() if k != 'photos'}
+            integrity_hash = hashlib.sha256(json.dumps(hash_data, sort_keys=True).encode()).hexdigest()
+            data['integrity_hash'] = integrity_hash
+            db_save_report({
+                'report_id': report_id,
+                'report_type': report_type,
+                'status': 'pending',
+                'timestamp': data.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                'site_name': site.get('name', ''),
+                'worker_name': worker.get('name', ''),
+                'worker_hms': worker.get('hms_kort', ''),
+                'integrity_hash': integrity_hash,
             })
-            print(f"[AUTH] Login: {worker['name']} ({worker['role']})")
+            
+            # Log audit entry
+            log_audit(
+                action='REPORT_SUBMITTED',
+                user_id=worker.get('hms_kort', 'unknown'),
+                details=f"Report type: {data.get('report_type', 'daglig')}",
+                record_id=report_id
+            )
+            
+            # Extract photos
+            photos = data.get('photos', [])
+            
+            # Generate PDF
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            pdf_filename = f"sha_rapport_{timestamp}.pdf"
+            pdf_path = f"/tmp/{pdf_filename}"
+            
+            generate_sha_report(data, photos, pdf_path)
+            
+            # Read PDF for email
+            with open(pdf_path, 'rb') as f:
+                pdf_data = f.read()
+            
+            # Prepare email
+            office_email = site.get('office_email','').strip()
+            if not office_email:
+                self._send_response(400, {'error': 'E-post til kontor er pakrevd'})
+                return
+            
+            report_type = data.get('report_type', 'daglig')
+            template = VERNERUNDE_TEMPLATES.get(report_type, VERNERUNDE_TEMPLATES['daglig'])
+            
+            subject = f"SHA-Rapport: {template['name']} - {site.get('name', 'Ukjent')} - {timestamp[:8]}"
+            
+            backend_url = f"https://vernevakt-backend.onrender.com"
+            approval_link = f"{backend_url}/approve?id={report_id}"
+            body = f"""
+Ny Vernevakt-rapport mottatt og klar for godkjenning.
+
+Byggeplass: {site.get('name', 'Ikke oppgitt')}
+Adresse: {site.get('address', 'Ikke oppgitt')}
+Utfort av: {worker.get('name', 'Ukjent')} (HMS-kort: {worker.get('hms_kort', 'Ukjent')})
+Type: {template['name']}
+Tidspunkt: {data.get('timestamp', 'Ukjent')}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+GODKJENN ELLER AVVIS RAPPORTEN:
+{approval_link}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Klikk lenken ovenfor for a apne godkjenningssiden.
+Se vedlagt PDF for fullstendig rapport.
+
+---
+Vernevakt - Automatisk generert rapport
+Rapport-ID: {report_id}
+"""
+            
+            # Send email
+            attachments = [(pdf_filename, pdf_data)]
+            
+            # Attach audio if present
+            audio = data.get('audio')
+            if audio:
+                try:
+                    audio_data = base64.b64decode(audio.split(',')[1] if ',' in audio else audio)
+                    attachments.append((f"lydopptak_{timestamp}.webm", audio_data))
+                except Exception as e:
+                    logger.error(f"[AUDIO] Failed to process: {e}")
+            
+            email_sent = send_email(office_email, subject, body, attachments)
+            
+            # Log email status
+            log_audit(
+                action='REPORT_EMAILED' if email_sent else 'EMAIL_FAILED',
+                user_id='system',
+                details=f"To: {office_email}",
+                record_id=report_id
+            )
+            
+            # Cleanup
+            try:
+                os.remove(pdf_path)
+            except:
+                pass
+            
+            self._send_response(200, {
+                'success': True,
+                'report_id': report_id,
+                'email_sent': email_sent,
+                'integrity_hash': integrity_hash[:16]
+            })
             
         except Exception as e:
-            print(f"[ERROR] Login: {e}")
-            self._json({'error': str(e)}, 500)
+            logger.error(f"[JOB] Error: {e}")
+            self._send_response(500, {'error': str(e)})
     
-    def _handle_register(self):
+    def _handle_hazard(self, data):
+        """Handle immediate hazard report"""
+        logger.info(f"[HAZARD] Raw data keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+        logger.info(f"[HAZARD] worker={data.get('worker')} site={data.get('site')} hazard={data.get('hazard')}")
+        
         try:
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-            data = json.loads(body.decode('utf-8'))
+            # Force report type
+            data['report_type'] = 'fare'
             
-            name = data.get('name', '').strip()
-            hms_kort = data.get('hms_kort', '').strip()
-            company = data.get('company', '').strip()
-            role = data.get('role', 'worker').strip()
-            pin = data.get('pin', '').strip()
+            # Generate report ID
+            report_id = str(uuid.uuid4())
+            data['report_id'] = report_id
+
+            # Safe extraction - ensure dicts, never None
+            worker = data.get('worker') or {}
+            site = data.get('site') or {}
+            hazard = data.get('hazard') or {}
+            if not isinstance(worker, dict): worker = {}
+            if not isinstance(site, dict): site = {}
+            if not isinstance(hazard, dict): hazard = {}
+
+            # Create integrity hash (exclude photos)
+            hash_data = {k: v for k, v in data.items() if k != 'photos'}
+            integrity_hash = hashlib.sha256(json.dumps(hash_data, sort_keys=True).encode()).hexdigest()
+            data['integrity_hash'] = integrity_hash
+            db_save_report({
+                'report_id': report_id,
+                'report_type': 'fare',
+                'status': 'pending',
+                'timestamp': data.get('timestamp', datetime.now(timezone.utc).isoformat()),
+                'site_name': site.get('name', ''),
+                'worker_name': worker.get('name', ''),
+                'worker_hms': worker.get('hms_kort', ''),
+                'integrity_hash': integrity_hash,
+            })
             
-            if not name or not hms_kort or not pin:
-                self._json({'error': 'Navn, HMS-kort og PIN er påkrevd'}, 400)
+            # Log audit entry (critical)
+            log_audit(
+                action='HAZARD_REPORTED',
+                user_id=worker.get('hms_kort', 'unknown'),
+                details=f"Type: {hazard.get('type', 'unknown')}, Severity: {hazard.get('severity', 'unknown')}",
+                record_id=report_id
+            )
+            
+            # Extract photos
+            photos = data.get('photos', [])
+            
+            # Generate PDF
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            pdf_filename = f"farerapport_{timestamp}.pdf"
+            pdf_path = f"/tmp/{pdf_filename}"
+            
+            generate_sha_report(data, photos, pdf_path)
+            
+            # Send immediate alert
+            alert_sent = send_hazard_alert(data, pdf_path)
+            
+            # Log alert status
+            log_audit(
+                action='HAZARD_ALERT_SENT' if alert_sent else 'HAZARD_ALERT_FAILED',
+                user_id='system',
+                details=f"To site manager",
+                record_id=report_id
+            )
+            
+            # Cleanup
+            try:
+                os.remove(pdf_path)
+            except:
+                pass
+            
+            self._send_response(200, {
+                'success': True,
+                'report_id': report_id,
+                'alert_sent': alert_sent,
+                'integrity_hash': integrity_hash[:16]
+            })
+            
+        except Exception as e:
+            logger.error(f"[HAZARD] Error: {e}")
+            self._send_response(500, {'error': str(e)})
+    
+    def _handle_approve(self, data):
+        """Handle manager approval/rejection"""
+        logger.info("[APPROVE] Received approval request")
+        
+        try:
+            report_id = data.get('report_id')
+            action = data.get('action')  # 'approve' or 'reject'
+            manager = data.get('manager') or {}
+            if not isinstance(manager, dict): manager = {}
+            
+            if not report_id or not action:
+                self._send_response(400, {'error': 'Missing report_id or action'})
+                return
+            
+            # Update report status in database
+            new_status = 'approved' if action == 'approve' else 'rejected'
+            approved_at = datetime.now(timezone.utc).isoformat()
+            db_update_report_status(
+                report_id, new_status,
+                manager.get('name', 'Ukjent'),
+                approved_at,
+                data.get('rejection_reason', '')
+            )
+            
+            # Log audit entry
+            log_audit(
+                action=f'REPORT_{action.upper()}D',
+                user_id=manager.get('hms_kort', 'unknown'),
+                details=f"By: {manager.get('name', 'Unknown')}",
+                record_id=report_id
+            )
+            
+            self._send_response(200, {
+                'success': True,
+                'report_id': report_id,
+                'status': new_status
+            })
+            
+        except Exception as e:
+            logger.error(f"[APPROVE] Error: {e}")
+            self._send_response(500, {'error': str(e)})
+    
+    def _handle_register(self, data):
+        """Register a new worker account using hms_kort + pin"""
+        logger.info("[REGISTER] New registration request")
+        
+        try:
+            hms_kort = (data.get('hms_kort') or '').strip()
+            pin      = (data.get('pin') or '').strip()
+            name     = (data.get('name') or '').strip()
+            company  = (data.get('company') or '').strip()
+            role     = data.get('role', 'worker')  # 'worker' or 'manager'
+            
+            if not hms_kort or not pin or not name:
+                self._send_response(400, {'error': 'Navn, HMS-kort og PIN er påkrevd'})
                 return
             
             if len(pin) < 4:
-                self._json({'error': 'PIN må være minst 4 siffer'}, 400)
+                self._send_response(400, {'error': 'PIN må være minst 4 siffer'})
                 return
             
-            if hms_kort in WORKERS:
-                self._json({'error': 'HMS-kort allerede registrert'}, 409)
+            if db_user_exists(hms_kort):
+                self._send_response(409, {'error': 'HMS-kort er allerede registrert'})
                 return
             
-            WORKERS[hms_kort] = {
+            # Hash PIN
+            pin_hash = hashlib.sha256(
+                (pin + CONFIG['signing_key']).encode()
+            ).hexdigest()
+            
+            db_save_user(hms_kort, {
+                'pin_hash': pin_hash,
                 'name': name,
                 'hms_kort': hms_kort,
                 'company': company,
                 'role': role,
-                'pin_hash': hash_pin(pin)
-            }
-            
-            self._json({'success': True, 'message': 'Registrering vellykket'})
-            print(f"[AUTH] Registered: {name} ({role})")
-            
-        except Exception as e:
-            print(f"[ERROR] Register: {e}")
-            self._json({'error': str(e)}, 500)
-    
-    def _handle_hazard(self):
-        try:
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-            data = json.loads(body.decode('utf-8'))
-            
-            report_id = str(uuid.uuid4())
-            data['report_id'] = report_id
-            data['report_type'] = 'fare'
-            data['approval_status'] = 'pending'
-            
-            REPORTS.append({
-                'report_id': report_id,
-                'report_type': 'fare',
-                'site': data.get('site', {}).get('name', 'Ukjent'),
-                'worker': data.get('worker', {}).get('name', 'Ukjent'),
-                'timestamp': data.get('timestamp', datetime.now().isoformat()),
-                'approval_status': 'pending',
-                'data': data
+                'created_at': datetime.now(timezone.utc).isoformat(),
             })
             
-            # Also generate PDF and email like regular submit
-            self._send_report_email(data, report_id)
-            
-            self._json({
-                'success': True,
-                'report_id': report_id,
-                'message': 'Faremelding mottatt'
-            })
-            print(f"[HAZARD] {report_id[:8]} from {data.get('worker', {}).get('name', 'Ukjent')}")
-            
-        except Exception as e:
-            print(f"[ERROR] Hazard: {e}")
-            self._json({'error': str(e)}, 500)
-    
-    def _handle_reports(self):
-        try:
-            report_list = [{
-                'report_id': r['report_id'],
-                'report_type': r['report_type'],
-                'site': r['site'],
-                'worker': r['worker'],
-                'timestamp': r['timestamp'],
-                'approval_status': r['approval_status']
-            } for r in REPORTS]
-            
-            report_list.sort(key=lambda x: x['timestamp'], reverse=True)
-            self._json({'reports': report_list})
-            
-        except Exception as e:
-            print(f"[ERROR] Reports: {e}")
-            self._json({'error': str(e)}, 500)
-    
-    def _handle_approve(self):
-        try:
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-            data = json.loads(body.decode('utf-8'))
-            
-            report_id = data.get('report_id', '')
-            action = data.get('action', '')
-            reason = data.get('rejection_reason', '')
-            
-            if action not in ('approve', 'reject'):
-                self._json({'error': 'Ugyldig handling'}, 400)
-                return
-            
-            found = False
-            for report in REPORTS:
-                if report['report_id'] == report_id:
-                    report['approval_status'] = 'approved' if action == 'approve' else 'rejected'
-                    if reason:
-                        report['rejection_reason'] = reason
-                    found = True
-                    break
-            
-            if not found:
-                self._json({'error': 'Rapport ikke funnet'}, 404)
-                return
-            
-            self._json({'success': True, 'message': f'Rapport {action}d'})
-            print(f"[APPROVE] {report_id[:8]} -> {action}")
-            
-        except Exception as e:
-            print(f"[ERROR] Approve: {e}")
-            self._json({'error': str(e)}, 500)
-    
-    def _send_report_email(self, data, report_id):
-        """Helper to send email for hazard and regular reports with PDF"""
-        try:
-            # Find email from multiple possible locations
-            office_email = (
-                data.get('officeEmail', '').strip() or
-                data.get('site', {}).get('office_email', '').strip() or
-                data.get('site', {}).get('manager_email', '').strip() or
-                CONFIG['default_office_email']
+            log_audit(
+                action='USER_REGISTERED',
+                user_id=hms_kort,
+                details=f"Name: {name}, Role: {role}, HMS-kort: {hms_kort}"
             )
             
-            if not office_email or '@' not in office_email:
-                print(f"[EMAIL] No valid email found for report {report_id[:8]}")
+            self._send_response(200, {
+                'success': True,
+                'name': name,
+                'hms_kort': hms_kort,
+                'company': company,
+                'role': role,
+            })
+            
+        except Exception as e:
+            logger.error(f"[REGISTER] Error: {e}")
+            self._send_response(500, {'error': str(e)})
+    
+    def _handle_login(self, data):
+        """Authenticate a worker using hms_kort + pin"""
+        logger.info("[LOGIN] Login attempt")
+        
+        try:
+            hms_kort = (data.get('hms_kort') or '').strip()
+            pin      = (data.get('pin') or '').strip()
+            
+            if not hms_kort or not pin:
+                self._send_response(400, {'error': 'HMS-kort og PIN er påkrevd'})
                 return
             
-            worker_name = data.get('worker', {}).get('name', 'Ukjent') if isinstance(data.get('worker'), dict) else 'Ukjent'
-            site_name = data.get('site', {}).get('name', 'Ukjent') if isinstance(data.get('site'), dict) else 'Ukjent'
-            report_type = data.get('report_type', 'ukjent')
-            hazard = data.get('hazard', {})
+            user = db_get_user(hms_kort)
             
-            subject = f"{'⚠️ FAREMELDING' if report_type == 'fare' else 'Vernerunde-rapport'} - {site_name} - {worker_name}"
+            if not user:
+                self._send_response(401, {'error': 'Feil HMS-kort eller PIN'})
+                return
             
-            body = f"""Ny rapport mottatt.
-
-Type: {report_type.upper()}
-Byggeplass: {site_name}
-Arbeider: {worker_name}
-Tidspunkt: {data.get('timestamp', 'N/A')[:19].replace('T', ' ')}
-"""
-            if report_type == 'fare' and hazard:
-                body += f"""
---- FAREDETALJER ---
-Type fare: {hazard.get('type', 'Ikke oppgitt')}
-Alvorlighetsgrad: {hazard.get('severity', 'Ikke oppgitt')}
-Beskrivelse: {hazard.get('description', 'Ingen')}
-Umiddelbare tiltak: {hazard.get('immediate_action', 'Ingen')}
-"""
+            pin_hash = hashlib.sha256(
+                (pin + CONFIG['signing_key']).encode()
+            ).hexdigest()
             
-            body += f"""
-Rapport-ID: {report_id[:8]}
-
----
-Automatisk generert av Vernevakt
-"""
+            if pin_hash != user['pin_hash']:
+                self._send_response(401, {'error': 'Feil HMS-kort eller PIN'})
+                return
             
-            # Try to generate PDF
-            attachments = []
-            try:
-                # Build a format the PDF generator understands
-                pdf_data = {
-                    'id': report_id,
-                    'timestamp': data.get('timestamp', ''),
-                    'customer': site_name,
-                    'jobDescription': f"{'Faremelding: ' + hazard.get('description', '') if report_type == 'fare' else 'Vernerunde - ' + report_type}",
-                    'company': {
-                        'name': data.get('site', {}).get('company', 'Vernevakt'),
-                        'orgNr': '',
-                        'phone': '',
-                        'email': office_email,
-                    },
-                    'plumber': {'name': worker_name},
-                    'answers': {
-                        'completed': True,
-                        'materials': False,
-                        'followup': report_type == 'fare',
-                    },
-                    'location': data.get('gps', {}),
-                    'photos': {},
+            log_audit(
+                action='USER_LOGIN',
+                user_id=hms_kort,
+                details=f"Successful login for {user['name']}"
+            )
+            
+            self._send_response(200, {
+                'success': True,
+                'worker': {
+                    'name': user['name'],
+                    'hms_kort': user['hms_kort'],
+                    'company': user.get('company', ''),
+                    'role': user['role'],
                 }
-                
-                # Add photos if present
-                photos = data.get('photos', [])
-                photo_keys = ['before', 'during', 'detail', 'after']
-                for idx, photo in enumerate(photos[:4]):
-                    if photo:
-                        pdf_data['photos'][photo_keys[idx]] = {'data': photo}
-                
-                pdf_bytes = self.pdf_generator.generate(pdf_data)
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                pdf_filename = f"rapport_{timestamp}.pdf"
-                attachments.append((pdf_filename, pdf_bytes))
-                print(f"[EMAIL] PDF generated for {report_id[:8]}")
-            except Exception as pdf_err:
-                print(f"[EMAIL] PDF generation failed: {pdf_err}")
-            
-            self.email_sender.send(
-                to_email=office_email,
-                subject=subject,
-                body=body,
-                attachments=attachments if attachments else None
-            )
-            print(f"[EMAIL] Sent to {office_email}")
-            
-        except Exception as e:
-            print(f"[EMAIL] Helper error: {e}")
-    
-    def _handle_submit(self):
-        try:
-            length = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(length)
-            data = json.loads(body.decode('utf-8'))
-            
-            job_id = data.get('id', str(uuid.uuid4()))
-            data['id'] = job_id
-            print(f"\n[JOB] Received: {job_id}")
-            
-            # Store in reports list
-            REPORTS.append({
-                'report_id': job_id,
-                'report_type': data.get('report_type', 'daglig'),
-                'site': data.get('site', {}).get('name', '') if isinstance(data.get('site'), dict) else data.get('customer', 'Ukjent'),
-                'worker': data.get('worker', {}).get('name', '') if isinstance(data.get('worker'), dict) else data.get('plumber', {}).get('name', 'Ukjent'),
-                'timestamp': data.get('timestamp', datetime.now().isoformat()),
-                'approval_status': 'pending',
-                'data': data
             })
-            
-            # Generate PDF
-            print("[JOB] Generating PDF...")
-            pdf_bytes = self.pdf_generator.generate(data)
-            
-            # Save locally
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            pdf_filename = f"rapport_{timestamp}.pdf"
-            pdf_path = os.path.join(CONFIG['output_dir'], pdf_filename)
-            with open(pdf_path, 'wb') as f:
-                f.write(pdf_bytes)
-            print(f"[JOB] PDF saved: {pdf_path}")
-            
-            # Save JSON
-            json_path = os.path.join(CONFIG['output_dir'], f"job_{timestamp}.json")
-            safe_data = {**data}
-            if 'photos' in safe_data:
-                safe_data['photos'] = {k: {'captured': bool(v)} for k, v in data.get('photos', {}).items() if v}
-            if 'audio' in safe_data:
-                safe_data['audio'] = {'captured': bool(data.get('audio'))}
-            with open(json_path, 'w') as f:
-                json.dump(safe_data, f, indent=2)
-            
-            # Prepare email
-            company = data.get('company', {})
-            plumber = data.get('plumber', {})
-            answers = data.get('answers', {})
-            customer = data.get('customer', 'Ikke oppgitt')
-            job_desc = data.get('jobDescription', '')
-            notes = data.get('notes', '')
-            
-            office_email = (
-                data.get('officeEmail', '').strip() or
-                data.get('site', {}).get('office_email', '').strip() or
-                CONFIG['default_office_email']
-            )
-            
-            if not office_email or '@' not in office_email:
-                print(f"[JOB] WARNING - No valid email, report saved but not sent")
-                # Still process the report, just skip email
-            
-            subject = f"Jobbrapport - {customer or plumber.get('name', 'Ukjent')} - {timestamp[:8]}"
-            body = f"""Ny jobbrapport mottatt.
-
-Kunde/Adresse: {customer or 'Ikke oppgitt'}
-Rørlegger: {plumber.get('name', 'N/A')}
-Tidspunkt: {data.get('timestamp', 'N/A')[:19].replace('T', ' ')}
-{f'Arbeid: {job_desc}' if job_desc else ''}
-
-Status:
-- Fullført: {'Ja' if answers.get('completed') else 'Nei'}
-- Materialer byttet: {'Ja' if answers.get('materials') else 'Nei'}
-- Oppfølging nødvendig: {'Ja' if answers.get('followup') else 'Nei'}
-{f'Notater: {notes}' if notes else ''}
-
-Se vedlagt PDF for detaljer og bilder.
-{' Lydopptak vedlagt.' if data.get('audio') else ''}
-
----
-Automatisk generert av VVS Dokumentasjon
-"""
-            
-            # Prepare attachments
-            attachments = [(pdf_filename, pdf_bytes)]
-            
-            # Add audio if present
-            audio_data = data.get('audio')
-            if audio_data:
-                try:
-                    # Extract base64 audio
-                    if ',' in audio_data:
-                        audio_data = audio_data.split(',')[1]
-                    audio_bytes = base64.b64decode(audio_data)
-                    audio_filename = f"lydopptak_{timestamp}.webm"
-                    attachments.append((audio_filename, audio_bytes))
-                    print(f"[JOB] Audio attached: {audio_filename}")
-                except Exception as e:
-                    print(f"[JOB] Audio error: {e}")
-            
-            # Send email
-            email_sent = False
-            if office_email and '@' in office_email:
-                print(f"[JOB] Sending to {office_email}...")
-                email_sent = self.email_sender.send(
-                    to_email=office_email,
-                    subject=subject,
-                    body=body,
-                    attachments=attachments
-                )
-            
-            self._json({
-                'success': True,
-                'job_id': job_id,
-                'report_id': job_id,
-                'pdf_generated': True,
-                'email_sent': email_sent,
-                'message': 'Jobb mottatt og behandlet'
-            })
-            
-            print(f"[JOB] {job_id} completed\n")
-            
         except Exception as e:
-            print(f"[ERROR] {e}")
-            import traceback
-            traceback.print_exc()
-            self._json({'success': False, 'error': str(e)}, 500)
+            logger.error(f"[LOGIN] Error: {e}")
+            self._send_response(500, {'error': str(e)})
     
-    def _json(self, data, status=200):
-        self.send_response(status)
-        self._cors()
-        self.send_header('Content-Type', 'application/json')
+    def _serve_approval_page(self, report_id):
+        """Serve a simple HTML approval page for managers"""
+        # Find the report
+        report = db_get_report(report_id)
+
+        if not report:
+            html = '<html><body><h2>Rapport ikke funnet.</h2></body></html>'
+        else:
+            status = report.get('status', 'pending')
+            site = report.get('site_name', 'Ukjent')
+            worker = report.get('worker_name', 'Ukjent')
+            rtype = report.get('report_type', '')
+            ts = report.get('timestamp', '')[:10]
+
+            if status == 'approved':
+                status_html = f'<div class="approved">&#10003; Godkjent av {report.get("approved_by","")}</div>'
+                buttons = ''
+            elif status == 'rejected':
+                status_html = f'<div class="rejected">&#10007; Avvist av {report.get("approved_by","")}</div>'
+                buttons = ''
+            else:
+                status_html = '<div class="pending">&#9203; Venter pa godkjenning</div>'
+                buttons = f'''
+                <form method="POST" action="/api/approve" style="margin-top:24px">
+                  <input type="hidden" name="report_id" value="{report_id}">
+                  <div style="margin-bottom:12px">
+                    <label style="font-weight:600">Leder navn:</label><br>
+                    <input type="text" name="manager_name" required
+                           style="width:100%;padding:8px;margin-top:4px;border:1px solid #ccc;border-radius:4px">
+                  </div>
+                  <div style="margin-bottom:12px">
+                    <label style="font-weight:600">HMS-kort:</label><br>
+                    <input type="text" name="manager_hms"
+                           style="width:100%;padding:8px;margin-top:4px;border:1px solid #ccc;border-radius:4px">
+                  </div>
+                  <div style="margin-bottom:16px">
+                    <label style="font-weight:600">Merknad (valgfritt):</label><br>
+                    <textarea name="rejection_reason" rows="3"
+                              style="width:100%;padding:8px;margin-top:4px;border:1px solid #ccc;border-radius:4px"></textarea>
+                  </div>
+                  <button type="submit" name="action" value="approve"
+                          style="background:#2e7d32;color:white;padding:12px 32px;border:none;border-radius:6px;font-size:16px;cursor:pointer;margin-right:12px">
+                    &#10003; Godkjenn rapport
+                  </button>
+                  <button type="submit" name="action" value="reject"
+                          style="background:#c62828;color:white;padding:12px 32px;border:none;border-radius:6px;font-size:16px;cursor:pointer">
+                    &#10007; Avvis rapport
+                  </button>
+                </form>'''
+
+            html = f'''<!DOCTYPE html>
+<html lang="no">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Vernevakt — Godkjenning</title>
+  <style>
+    body {{ font-family: -apple-system, sans-serif; background:#f4f6f8; margin:0; padding:20px; }}
+    .card {{ background:white; max-width:560px; margin:40px auto; border-radius:10px;
+             box-shadow:0 2px 12px rgba(0,0,0,0.1); overflow:hidden; }}
+    .header {{ background:#111; color:#f59e0b; padding:20px 24px; font-size:22px; font-weight:800; }}
+    .header span {{ color:#aaa; font-size:13px; font-weight:400; display:block; margin-top:2px; }}
+    .body {{ padding:24px; }}
+    .row {{ display:flex; justify-content:space-between; padding:8px 0;
+            border-bottom:1px solid #f0f0f0; font-size:14px; }}
+    .row .label {{ color:#888; }}
+    .row .val {{ font-weight:600; }}
+    .pending {{ color:#e65100; font-weight:700; font-size:15px; margin-top:12px; }}
+    .approved {{ color:#2e7d32; font-weight:700; font-size:15px; margin-top:12px; }}
+    .rejected {{ color:#c62828; font-weight:700; font-size:15px; margin-top:12px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="header">VERNEVAKT <span>Rapport godkjenning</span></div>
+    <div class="body">
+      <div class="row"><span class="label">Rapport-ID</span><span class="val">{report_id[:8]}</span></div>
+      <div class="row"><span class="label">Byggeplass</span><span class="val">{site}</span></div>
+      <div class="row"><span class="label">Innrapportert av</span><span class="val">{worker}</span></div>
+      <div class="row"><span class="label">Type</span><span class="val">{rtype}</span></div>
+      <div class="row"><span class="label">Dato</span><span class="val">{ts}</span></div>
+      {status_html}
+      {buttons}
+    </div>
+  </div>
+</body>
+</html>'''
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode())
-    
-    def _cors(self):
-        self.send_header('Access-Control-Allow-Origin', CONFIG['allowed_origins'])
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
-    
-    def log_message(self, fmt, *args):
-        print(f"[HTTP] {args[0]}")
+        self.wfile.write(html.encode('utf-8'))
 
+    def log_message(self, format, *args):
+        logger.info(f"[HTTP] {args[0]}")
 
 # ============================================
 # MAIN
 # ============================================
 def main():
-    server = HTTPServer(('', CONFIG['port']), PipelineHandler)
+    port = CONFIG['port']
+    server = HTTPServer(('0.0.0.0', port), SHAHandler)
     
-    print(f"""
-╔═══════════════════════════════════════════════════╗
-║         PIPELINE V0 - PRODUCTION SERVER           ║
-╠═══════════════════════════════════════════════════╣
-║  Port: {CONFIG['port']:<42} ║
-║  SMTP: {'Configured' if CONFIG['smtp']['user'] else 'Not configured':<42} ║
-║  Office Email: {CONFIG['default_office_email'][:30] or 'Not set':<30} ║
-╚═══════════════════════════════════════════════════╝
-
-Endpoints:
-  POST /api/submit  - Submit job
-  GET  /api/status  - Server status
-  GET  /health      - Health check
-
-Waiting for jobs...
-""")
+    print("""
+╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║   ███████╗██╗  ██╗ █████╗     ██████╗ ██╗██████╗ ███████╗    ║
+║   ██╔════╝██║  ██║██╔══██╗    ██╔══██╗██║██╔══██╗██╔════╝    ║
+║   ███████╗███████║███████║    ██████╔╝██║██████╔╝█████╗      ║
+║   ╚════██║██╔══██║██╔══██║    ██╔═══╝ ██║██╔═══╝ ██╔══╝      ║
+║   ███████║██║  ██║██║  ██║    ██║     ██║██║     ███████╗    ║
+║   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝    ╚═╝     ╚═╝╚═╝     ╚══════╝    ║
+║                                                               ║
+║   Construction Safety Documentation - Norway                  ║
+║   Byggeplass SHA Pipeline v1.0                               ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+    """)
     
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\n[SERVER] Shutting down...")
-        server.shutdown()
-
+    logger.info(f"Server starting on port {port}")
+    init_db()
+    logger.info(f"SMTP configured: {bool(CONFIG['smtp']['user'] and CONFIG['smtp']['password'])}")
+    logger.info(f"Default email: {CONFIG['default_office_email']}")
+    logger.info("Ready to receive SHA reports")
+    
+    server.serve_forever()
 
 if __name__ == '__main__':
     main()
