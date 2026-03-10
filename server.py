@@ -503,32 +503,48 @@ def generate_sha_report(data, photos, output_path):
     # Dark background
     d.add(Rect(0, 0, hdr_w, hdr_h, fillColor=DARKBG, strokeColor=None))
 
-    # ── HARD HAT (scaled to fit ~22mm tall) ──
-    # Helmet center x=18mm, yellow dome+body
-    hx = 18 * mm   # center x
-    hy = 5 * mm    # bottom of brim
-    # Orange brim: width=12mm, height=2.5mm — narrower
-    brim_w = 12 * mm
-    brim_h = 2.5 * mm
-    d.add(Rect(hx - brim_w/2, hy, brim_w, brim_h, fillColor=RUST, strokeColor=None))
-    # Yellow body rectangle: width=15mm, height=7mm
-    body_w = 15 * mm
-    body_h = 7 * mm
-    body_y = hy + brim_h
-    d.add(Rect(hx - body_w/2, body_y, body_w, body_h, fillColor=YELLOW, strokeColor=None))
-    # Yellow dome: semicircle on top of body, radius=7.5mm
-    dome_r = 7.5 * mm
-    dome_y = body_y + body_h
-    # Draw semicircle as polygon approximation
+    # ── HARD HAT — matches approved icon exactly ──
     import math
+    # SVG original: 512x512, helmet: dome r=155 centered at x=256,y=265
+    # body: x=101,y=265,w=310,h=114  brim: x=130,y=379,w=252,h=50
+    # Scale to fit in ~22mm height, centered at hx
+    hx = 18 * mm   # center x of helmet
+    scale = 0.038 * mm  # maps 512px → ~19mm
+
+    # Yellow body rectangle (sits below dome)
+    body_x = (101 * scale)
+    body_y_svg = 265 * scale
+    body_w = 310 * scale
+    body_h = 114 * scale
+    # Orange brim (narrower, below body)
+    brim_x = 130 * scale
+    brim_w = 252 * scale
+    brim_h = 50 * scale
+    brim_y_svg = 379 * scale
+
+    # Offset so helmet is centered at hx, bottom of brim at 3mm
+    bottom = 3 * mm
+    brim_y = bottom
+    body_y = brim_y + brim_h
+    dome_base_y = body_y + body_h
+
+    # Center x offset
+    cx_offset = hx - (256 * scale)
+
+    # Draw orange brim
+    d.add(Rect(cx_offset + brim_x, brim_y, brim_w, brim_h, fillColor=RUST, strokeColor=None))
+    # Draw yellow body
+    d.add(Rect(cx_offset + body_x, body_y, body_w, body_h, fillColor=YELLOW, strokeColor=None))
+    # Draw yellow dome (semicircle)
+    dome_r = 155 * scale
+    dome_cx = hx
     pts = []
     for i in range(19):
         angle = math.pi * i / 18
-        px = hx + dome_r * math.cos(math.pi - angle)
-        py = dome_y + dome_r * math.sin(angle)
+        px = dome_cx + dome_r * math.cos(math.pi - angle)
+        py = dome_base_y + dome_r * math.sin(angle)
         pts.extend([px, py])
-    # Close bottom of dome
-    pts.extend([hx + dome_r, dome_y, hx - dome_r, dome_y])
+    pts.extend([dome_cx + dome_r, dome_base_y, dome_cx - dome_r, dome_base_y])
     d.add(Polygon(pts, fillColor=YELLOW, strokeColor=None))
 
     # ── DIVIDER LINE ──
